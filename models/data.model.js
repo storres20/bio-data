@@ -9,6 +9,10 @@ const dataSchema = new mongoose.Schema({
         required: true,
         type: String
     },
+    dsTemperature: {
+        required: true,
+        type: String
+    }
 })
 
 module.exports = mongoose.model('Data', dataSchema)

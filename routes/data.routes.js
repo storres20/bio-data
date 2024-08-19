@@ -12,6 +12,7 @@ router.post('/data', async (req, res) => {
     const data = new Model({
         temperature: req.body.temperature,
         humidity: req.body.humidity,
+        dsTemperature: req.body.dsTemperature
     })
 
     try {
