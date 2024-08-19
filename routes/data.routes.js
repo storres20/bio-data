@@ -36,3 +36,13 @@ router.get('/', async (req, res) => {
         res.status(500).json({ message: error.message })
     }
 })
+
+// DELETE Method - delete all data
+router.delete('/', async (req, res) => {
+    try {
+        await Model.deleteMany({}); // This deletes all documents
+        res.status(200).json({ message: 'All data deleted successfully' });
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+});
