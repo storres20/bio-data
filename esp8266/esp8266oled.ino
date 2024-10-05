@@ -1,15 +1,12 @@
 #include <ESP8266WiFi.h>
 #include <WiFiManager.h>  // WiFiManager library
-
 #include <DHT.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-
 #include <EEPROM.h>  // EEPROM library for storing username
-
-// Include OLED libraries
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
+#include <time.h>  // Time library for NTP
 
 // Pin definitions
 #define DHTPIN D4     // Pin where the DHT11 is connected
@@ -95,6 +92,12 @@ void setup() {
 
   // Turn on the LED to indicate successful WiFi connection
   digitalWrite(LED_PIN, HIGH);
+
+  // Initialize NTP for time syncing
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov"); // Use NTP server to get time
+
+  // Wait for time to be synchronized
+  waitForNTPTime();  // LED will blink during this process
 }
 
 void loop() {
@@ -123,7 +126,10 @@ void loop() {
     client.setInsecure(); // Disable certificate verification
 
     if (client.connect(host, 443)) {
-      String jsonPayload = "{\"username\":\"" + String(username) + "\", \"temperature\":" + String(temperature) + ", \"humidity\":" + String(humidity) + ", \"dsTemperature\":" + String(dsTemperature) + "}";
+      // Get the current time as a string
+      String datetime = getDateTimeString();
+
+      String jsonPayload = "{\"username\":\"" + String(username) + "\", \"temperature\":" + String(temperature) + ", \"humidity\":" + String(humidity) + ", \"dsTemperature\":" + String(dsTemperature) + ", \"datetime\":\"" + datetime + "\"}";
 
       client.println("POST " + String(postServerUrl) + " HTTP/1.1");
       client.println("Host: " + String(host));
@@ -165,6 +171,23 @@ void loop() {
   Serial.println("°C");
 
   delay(500); // Repeat every 0.5 seconds
+}
+
+// Function to wait for NTP time synchronization and blink the LED
+void waitForNTPTime() {
+  bool ledState = LOW;  // Initial LED state (off)
+  while (time(nullptr) < 8 * 3600 * 2) {  // Wait for valid time (> 1/1/1970)
+    Serial.println("Waiting for NTP time sync...");
+
+    // Blink the LED by toggling its state
+    ledState = !ledState;  // Toggle the LED state
+    digitalWrite(LED_PIN, ledState);  // Update the LED state
+    delay(500);  // Wait for 500ms before the next toggle
+  }
+
+  // Once synchronized, turn the LED fully on
+  digitalWrite(LED_PIN, HIGH);  // LED stays on
+  Serial.println("NTP time synchronized.");
 }
 
 // Function to display data on OLED
@@ -224,4 +247,15 @@ void saveUsername(char* input) {
     EEPROM.write(USERNAME_ADDR + i, input[i]);
   }
   EEPROM.commit(); // Commit the write to EEPROM
+}
+
+// Function to get the current datetime as a string
+String getDateTimeString() {
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
+
+  char buffer[25];
+  strftime(buffer, sizeof(buffer), "%Y/%m/%d %H:%M:%S", timeinfo); // Day/Month/Year format
+
+  return String(buffer);
 }
