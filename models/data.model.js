@@ -12,6 +12,10 @@ const dataSchema = new mongoose.Schema({
     dsTemperature: {
         required: true,
         type: String
+    },
+    username: {
+        required: true,
+        type: String
     }
 })
 
