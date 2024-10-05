@@ -39,6 +39,23 @@ router.get('/', async (req, res) => {
     }
 })
 
+// Get data by username
+router.get('/username/:username', async (req, res) => {
+    try {
+        const username = req.params.username; // Get the username from the URL parameters
+        const data = await Model.find({ username: username }); // Find records by username
+
+        if (data.length === 0) {
+            return res.status(404).json({ message: 'No data found for this username' });
+        }
+
+        res.json(data); // Return the data for the given username
+    } catch (error) {
+        res.status(500).json({ message: error.message }); // Handle any errors
+    }
+});
+
+
 // DELETE Method - delete all data
 router.delete('/', async (req, res) => {
     try {
