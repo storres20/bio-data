@@ -16,6 +16,10 @@ const dataSchema = new mongoose.Schema({
     username: {
         required: true,
         type: String
+    },
+    datetime: {
+        required: true,
+        type: Date
     }
 })
 

@@ -13,7 +13,8 @@ router.post('/data', async (req, res) => {
         temperature: req.body.temperature,
         humidity: req.body.humidity,
         dsTemperature: req.body.dsTemperature,
-        username: req.body.username
+        username: req.body.username,
+        datetime: req.body.datetime
     })
 
     try {
