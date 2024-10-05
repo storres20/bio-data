@@ -5,9 +5,6 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
-#include <Wire.h>
-#include <Keypad.h>
-#include <Keypad_I2C.h>
 #include <EEPROM.h>  // EEPROM library for storing username
 
 // Include OLED libraries
@@ -36,31 +33,12 @@ WiFiManager wifiManager; // Declare globally for access in loop()
 
 volatile bool resetTriggered = false;  // Flag to indicate button press
 
-// Keypad setup
-const byte ROWS = 4; // Four rows
-const byte COLS = 4; // Four columns
-char keys[ROWS][COLS] = {
-  {'1','2','3','A'},
-  {'4','5','6','B'},
-  {'7','8','9','C'},
-  {'*','0','#','D'}
-};
-
-// Virtual row and column pin numbers
-byte rowPins[ROWS] = {0, 1, 2, 3}; // Virtual row pins for I2C
-byte colPins[COLS] = {4, 5, 6, 7}; // Virtual column pins for I2C
-
-// I2C address of the PCF8574 connected to the keypad
-const byte KEYPAD_I2C_ADDRESS = 0x20; // Adjust based on your wiring
-
-byte numPins = ROWS + COLS; // Total number of pins
-
-Keypad_I2C keypad = Keypad_I2C(makeKeymap(keys), rowPins, colPins, ROWS, COLS, KEYPAD_I2C_ADDRESS, numPins, &Wire);
-
 // OLED setup
 Adafruit_SH1106G display = Adafruit_SH1106G(128, 64, &Wire); // Create an instance of the display
 
 char username[16]; // To store the input username
+
+WiFiManagerParameter custom_username("username", "Enter username", "", 16); // Custom parameter for username
 
 void ICACHE_RAM_ATTR resetWiFiSettings() {
   resetTriggered = true;  // Set the flag when the button is pressed
@@ -86,30 +64,33 @@ void setup() {
   // Attach an interrupt to the reset button pin
   attachInterrupt(digitalPinToInterrupt(RESET_PIN), resetWiFiSettings, FALLING);
 
-  // Initialize I2C for Keypad and OLED
+  // Initialize I2C for OLED
   Wire.begin(D2, D1); // SDA = D2 (GPIO4), SCL = D1 (GPIO5)
-
-  // Initialize Keypad
-  keypad.begin(); // Initialize the keypad
 
   // Initialize OLED display
   display.begin(0x3C, true); // Address 0x3C (change if your OLED uses a different I2C address)
   display.clearDisplay();
   display.display();
 
+  // Add custom parameter to WiFiManager
+  wifiManager.addParameter(&custom_username);
+
   // Automatically connect to saved WiFi or start AP for configuration if no network is available
   wifiManager.autoConnect("ESP8266-Setup", "password123");
 
-  // Check if a username is already stored in EEPROM
-  if (isUsernameStored()) {
-    // Greet the saved username
-    getUsername();
-    Serial.print("Hello, ");
-    Serial.println(username);
-    displayGreetingOnOLED(username);  // Correct function call here
+  // After connection, get the username from the custom field
+  strcpy(username, custom_username.getValue());
+
+  // Convert username to lowercase
+  toLowerCase(username);
+
+  // Check if a username was entered and store it in EEPROM
+  if (strlen(username) > 0) {
+    saveUsername(username); // Save username to EEPROM
+  } else if (isUsernameStored()) {
+    getUsername(); // Retrieve stored username from EEPROM
   } else {
-    // Ask for the username if not stored
-    askForUsername();
+    strcpy(username, "guest"); // Default username
   }
 
   // Turn on the LED to indicate successful WiFi connection
@@ -135,14 +116,6 @@ void loop() {
   // Update OLED display
   displayDataOnOLED(temperature, humidity, dsTemperature);
 
-  // Handle keypad input
-  char key = keypad.getKey();
-  if (key) {
-    Serial.print("Key pressed: ");
-    Serial.println(key);
-    // Implement any functionality you need with the keypad here
-  }
-
   if (WiFi.status() == WL_CONNECTED) {
     digitalWrite(LED_PIN, HIGH); // Turn on LED while WiFi is connected
 
@@ -150,7 +123,7 @@ void loop() {
     client.setInsecure(); // Disable certificate verification
 
     if (client.connect(host, 443)) {
-      String jsonPayload = "{\"temperature\":" + String(temperature) + ", \"humidity\":" + String(humidity) + ", \"dsTemperature\":" + String(dsTemperature) + "}";
+      String jsonPayload = "{\"username\":\"" + String(username) + "\", \"temperature\":" + String(temperature) + ", \"humidity\":" + String(humidity) + ", \"dsTemperature\":" + String(dsTemperature) + "}";
 
       client.println("POST " + String(postServerUrl) + " HTTP/1.1");
       client.println("Host: " + String(host));
@@ -201,19 +174,24 @@ void displayDataOnOLED(float tempDHT, float humDHT, float tempDS) {
   display.setTextSize(1);      // Normal 1:1 pixel scale
   display.setTextColor(SH110X_WHITE); // Draw white text
 
+  // Display greeting
+  display.setCursor(0, 0);
+  display.print("Welcome ");
+  display.print(username);
+
   // Display DHT11 readings
-  display.setCursor(0, 10);
-  display.print("DHT11 Temp: ");
+  display.setCursor(0, 20);
+  display.print("Temp: ");
   display.print(tempDHT);
   display.print(" C");
 
-  display.setCursor(0, 20);
+  display.setCursor(0, 30);
   display.print("Humidity: ");
   display.print(humDHT);
   display.print(" %");
 
   // Display DS18B20 reading
-  display.setCursor(0, 30);
+  display.setCursor(0, 40);
   display.print("DS18B20 Temp: ");
   display.print(tempDS);
   display.print(" C");
@@ -221,15 +199,11 @@ void displayDataOnOLED(float tempDHT, float humDHT, float tempDS) {
   display.display(); // Send buffer to display
 }
 
-// New function to display greeting on OLED
-void displayGreetingOnOLED(char* user) {
-  display.clearDisplay(); // Clear the buffer
-  display.setTextSize(1); // Normal 1:1 pixel scale
-  display.setTextColor(SH110X_WHITE); // Draw white text
-  display.setCursor(0, 10);
-  display.print("Hello, ");
-  display.print(user);
-  display.display(); // Send buffer to display
+// Convert username to lowercase
+void toLowerCase(char* str) {
+  for (int i = 0; str[i]; i++) {
+    str[i] = tolower(str[i]);
+  }
 }
 
 // Check if username is stored in EEPROM
@@ -250,30 +224,4 @@ void saveUsername(char* input) {
     EEPROM.write(USERNAME_ADDR + i, input[i]);
   }
   EEPROM.commit(); // Commit the write to EEPROM
-}
-
-// Ask for a username using the keypad and save it
-void askForUsername() {
-  char key;
-  int index = 0;
-
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.print("Enter Username: ");
-  display.display();
-
-  while (index < 16) {
-    key = keypad.getKey();
-    if (key) {
-      if (key == '#') { // Finish input when '#' is pressed
-        username[index] = '\0'; // Null-terminate the string
-        break;
-      }
-      username[index] = key; // Store the key press
-      index++;
-    }
-  }
-
-  saveUsername(username); // Save the input username to EEPROM
-  displayGreetingOnOLED(username); // Greet the user on OLED after saving
 }
