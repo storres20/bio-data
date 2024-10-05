@@ -47,3 +47,15 @@ router.delete('/', async (req, res) => {
         res.status(500).json({ message: error.message });
     }
 });
+
+// Get usernames Method - fetch all unique usernames
+router.get('/usernames', async (req, res) => {
+    try {
+        // Use distinct to get a list of unique usernames
+        const usernames = await Model.distinct('username');
+        res.status(200).json(usernames);
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+});
+
