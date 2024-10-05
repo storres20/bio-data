@@ -48,6 +48,22 @@ router.delete('/', async (req, res) => {
     }
 });
 
+// DELETE Method - delete data by username
+router.delete('/:username', async (req, res) => {
+    const { username } = req.params;
+    try {
+        const result = await Model.deleteMany({ username: username }); // This deletes documents matching the username
+        if (result.deletedCount > 0) {
+            res.status(200).json({ message: `All data for user ${username} deleted successfully` });
+        } else {
+            res.status(404).json({ message: `No data found for user ${username}` });
+        }
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+});
+
+
 // Get usernames Method - fetch all unique usernames
 router.get('/usernames', async (req, res) => {
     try {
