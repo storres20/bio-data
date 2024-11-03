@@ -7,7 +7,7 @@ const WebSocket = require('ws'); // WebSocket server
 const datas = require('./routes/data.routes'); // Existing data routes
 const fs = require('fs'); // File system module
 const https = require('https'); // HTTPS module
-const DataModel = require('./models/data.model'); // Mongoose data model for saving WebSocket data
+//const DataModel = require('./models/data.model'); // Mongoose data model for saving WebSocket data
 
 // Database connection - MongoDB
 const mongoString = process.env.DATABASE_URL;
@@ -44,8 +44,8 @@ app.use('/api/v1/datas', datas);
 
 // SSL options
 const options = {
-    key: fs.readFileSync('/etc/letsencrypt/live/temphu.lonkansoft.pro/privkey.pem'),
-    cert: fs.readFileSync('/etc/letsencrypt/live/temphu.lonkansoft.pro/fullchain.pem')
+    key: fs.readFileSync('/etc/letsencrypt/live/temphu.website101.xyz/privkey.pem'),
+    cert: fs.readFileSync('/etc/letsencrypt/live/temphu.website101.xyz/fullchain.pem')
 };
 
 // Create HTTPS server
@@ -74,7 +74,8 @@ wss.on('connection', (ws) => {
             // Log the parsed data
             console.log('Parsed Data:', data);
 
-            // Save the parsed data to MongoDB
+            // Commented out the lines that save data to MongoDB
+            /*
             const newData = new DataModel({
                 temperature: data.temperature,
                 humidity: data.humidity,
@@ -97,6 +98,15 @@ wss.on('connection', (ws) => {
             } catch (error) {
                 console.error('Error saving data to MongoDB:', error);
             }
+            */
+
+            // Broadcast the data back to all connected WebSocket clients
+            wss.clients.forEach((client) => {
+                if (client.readyState === WebSocket.OPEN) {
+                    client.send(JSON.stringify(data));
+                }
+            });
+
         } catch (error) {
             console.error('Error parsing message:', error);
         }
