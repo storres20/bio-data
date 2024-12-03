@@ -1,58 +1,55 @@
-/* 19/10/2024 14:18 hours - This code finally works with websockets and SSL */
-
 #include <ESP8266WiFi.h>
-#include <ArduinoWebsockets.h>  // Include ArduinoWebsockets library
+#include <ArduinoWebsockets.h>
 using namespace websockets;
-#include <WiFiManager.h>       // WiFiManager library
+#include <WiFiManager.h>
 #include <DHT.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <EEPROM.h>            // EEPROM library for storing username
+#include <EEPROM.h>
 #include <Adafruit_GFX.h>
-#include <Adafruit_SH110X.h>
-#include <time.h>              // Time library for NTP
+#include <Adafruit_SSD1306.h>
+#include <time.h>
 
 // Pin definitions
-#define DHTPIN D4        // Pin where the DHT11 is connected
-#define DHTTYPE DHT11    // DHT 11
-#define ONE_WIRE_BUS D3  // DS18B20 sensor
-#define LED_PIN D5       // LED pin
-#define RESET_PIN D6     // Reset button pin
+#define DHTPIN D4
+#define DHTTYPE DHT11
+#define ONE_WIRE_BUS D3
+#define LED_PIN D5
+#define RESET_PIN D6
+#define BUTTON_PIN D7       // Define a new pin for the button
 
 // EEPROM settings
-#define EEPROM_SIZE 32   // Size to store the username
-#define USERNAME_ADDR 0  // Starting address for the username
+#define EEPROM_SIZE 32
+#define USERNAME_ADDR 0
 
-// Replace with your server IP and port
-const char* serverIP = "temphu.website101.xyz";  // Backend server domain
-const uint16_t serverPort = 3002;                // Backend server port
+const char* serverIP = "temphu.website101.xyz";
+const uint16_t serverPort = 3002;
 
 DHT dht(DHTPIN, DHTTYPE);
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 
-WiFiManager wifiManager; // For Wi-Fi management
+WiFiManager wifiManager;
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// OLED setup
-Adafruit_SH1106G display = Adafruit_SH1106G(128, 64, &Wire);
-
-char username[16]; // To store the input username
-
+char username[16];
 WiFiManagerParameter custom_username("username", "Enter username", "", 16);
+WebsocketsClient webSocket;
 
-WebsocketsClient webSocket; // WebSocket client
-
-volatile bool resetTriggered = false;  // Flag to indicate button press
-
+volatile bool resetTriggered = false;
 unsigned long previousMillis = 0;
-const long interval = 2000;  // Interval at which to send data
+const long interval = 2000;
 
-// Function to handle WebSocket messages
+// Variables for button handling and display mode
+bool displayDT2 = false;       // Display mode flag
+bool lastButtonState = HIGH;   // Last button state (not pressed)
+
 void webSocketMessage(WebsocketsMessage message) {
   Serial.printf("WebSocket Message Received: %s\n", message.data().c_str());
 }
 
-// Function to handle WebSocket events
 void webSocketEvent(WebsocketsEvent event, String data) {
   if (event == WebsocketsEvent::ConnectionOpened) {
     Serial.println("WebSocket Connected");
@@ -66,42 +63,38 @@ void webSocketEvent(WebsocketsEvent event, String data) {
 }
 
 void ICACHE_RAM_ATTR resetWiFiSettings() {
-  resetTriggered = true;  // Set the flag when the button is pressed
+  resetTriggered = true;
 }
 
 void setup() {
   Serial.begin(115200);
-
-  // Initialize EEPROM
   EEPROM.begin(EEPROM_SIZE);
-
-  // Initialize sensors
   dht.begin();
   sensors.begin();
 
-  // Initialize the LED pin
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);  // Turn off LED initially
+  digitalWrite(LED_PIN, LOW);
 
-  // Initialize the reset button pin
   pinMode(RESET_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(RESET_PIN), resetWiFiSettings, FALLING);
 
-  // Initialize I2C for OLED
-  Wire.begin(D2, D1);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);  // Set button pin as input with pull-up resistor
 
-  // Initialize OLED display
-  display.begin(0x3C, true);
+  Wire.begin(D2, D1);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;);
+  }
   display.clearDisplay();
   display.display();
 
-  // Add custom parameter to WiFiManager
   wifiManager.addParameter(&custom_username);
+  wifiManager.autoConnect("ESP8266-Setup-01", "password123");
 
-  // Auto-connect to Wi-Fi
-  wifiManager.autoConnect("ESP8266-Setup", "password123");
+  Serial.println("Connected to Wi-Fi.");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
 
-  // After connection, get the username
   strcpy(username, custom_username.getValue());
   toLowerCase(username);
 
@@ -113,24 +106,20 @@ void setup() {
     strcpy(username, "guest");
   }
 
-  // Turn on the LED to indicate successful WiFi connection
   digitalWrite(LED_PIN, HIGH);
 
-  // Initialize NTP for time syncing
   //configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   configTime(-5 * 3600, 0, "pool.ntp.org", "time.nist.gov");
   waitForNTPTime();
 
-  // Initialize WebSocket
   webSocket.onMessage(webSocketMessage);
   webSocket.onEvent(webSocketEvent);
-  webSocket.setInsecure(); // Disable SSL certificate verification
+  webSocket.setInsecure();
   String wsUrl = "wss://" + String(serverIP) + ":" + String(serverPort) + "/";
   webSocket.connect(wsUrl);
 }
 
 void loop() {
-  // Check if the reset flag is set
   if (resetTriggered) {
     Serial.println("Reset button pressed! Clearing WiFi settings...");
     wifiManager.resetSettings();
@@ -138,31 +127,36 @@ void loop() {
     ESP.restart();
   }
 
-  // Handle WebSocket events
   webSocket.poll();
 
   unsigned long currentMillis = millis();
   if (currentMillis - previousMillis >= interval) {
     previousMillis = currentMillis;
 
-    // Read sensor data
     sensors.requestTemperatures();
     float dsTemperature = sensors.getTempCByIndex(0);
-
     float temperature = dht.readTemperature();
     float humidity = dht.readHumidity();
 
-    // Update OLED display
-    displayDataOnOLED(temperature, humidity, dsTemperature);
+    // Read button state to toggle display mode
+    bool buttonState = digitalRead(BUTTON_PIN);
+    if (buttonState == LOW && lastButtonState == HIGH) {
+      displayDT2 = !displayDT2;  // Toggle the display mode
+    }
+    lastButtonState = buttonState;
 
-    // Create JSON payload
+    // Update OLED display based on display mode
+    if (displayDT2) {
+      displayDT2Value(dsTemperature);
+    } else {
+      displayGreetingAndValues(temperature, humidity);
+    }
+
     String datetime = getDateTimeString();
     String jsonPayload = "{\"username\":\"" + String(username) + "\", \"temperature\":" + String(temperature) + ", \"humidity\":" + String(humidity) + ", \"dsTemperature\":" + String(dsTemperature) + ", \"datetime\":\"" + datetime + "\"}";
 
-    // Send data over WebSocket
     webSocket.send(jsonPayload);
 
-    // Display data on Serial Monitor
     Serial.print("DHT Temperature: ");
     Serial.print(temperature);
     Serial.print("°C, Humidity: ");
@@ -175,6 +169,47 @@ void loop() {
   }
 }
 
+// Display greeting and T1/H1 values on OLED
+void displayGreetingAndValues(float tempDHT, float humDHT) {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  
+  display.setCursor(0, 0);
+  //display.print("Hi ");
+  display.print(username);
+
+  display.setCursor(0, 20);
+  display.print("T1:");
+  display.print(tempDHT);
+  display.print("C");
+
+  display.setCursor(0, 40);
+  display.print("H1:");
+  display.print(humDHT);
+  display.print("%");
+
+  display.display();
+}
+
+// Display only DT2 value on OLED
+void displayDT2Value(float tempDS) {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  //display.print("Hi ");
+  display.print(username);
+
+  display.setCursor(0, 20);
+  display.print("DT2:");
+  display.print(tempDS);
+  display.print("C");
+
+  display.display();
+}
+
 // Convert username to lowercase
 void toLowerCase(char* str) {
   for (int i = 0; str[i]; i++) {
@@ -182,29 +217,25 @@ void toLowerCase(char* str) {
   }
 }
 
-// Check if username is stored in EEPROM
 bool isUsernameStored() {
-  return EEPROM.read(USERNAME_ADDR) != 0xFF; // 0xFF is default erased value
+  return EEPROM.read(USERNAME_ADDR) != 0xFF;
 }
 
-// Retrieve the stored username from EEPROM
 void getUsername() {
   for (int i = 0; i < 15; i++) {
     username[i] = EEPROM.read(USERNAME_ADDR + i);
   }
-  username[15] = '\0';  // Null-terminate
+  username[15] = '\0';
 }
 
-// Save the username to EEPROM
 void saveUsername(char* input) {
   for (int i = 0; i < 15; i++) {
     EEPROM.write(USERNAME_ADDR + i, input[i]);
   }
-  EEPROM.write(USERNAME_ADDR + 15, '\0');  // Save null terminator
-  EEPROM.commit(); // Commit the write to EEPROM
+  EEPROM.write(USERNAME_ADDR + 15, '\0');
+  EEPROM.commit();
 }
 
-// Function to wait for NTP time synchronization and blink the LED
 void waitForNTPTime() {
   bool ledState = LOW;
   while (time(nullptr) <= 100000) {
@@ -217,34 +248,10 @@ void waitForNTPTime() {
   Serial.println("NTP time synchronized.");
 }
 
-// Function to get the current datetime as a string
 String getDateTimeString() {
   time_t now = time(nullptr);
   struct tm* timeinfo = localtime(&now);
   char buffer[25];
   strftime(buffer, sizeof(buffer), "%Y/%m/%d %H:%M:%S", timeinfo);
   return String(buffer);
-}
-
-// Function to display data on OLED
-void displayDataOnOLED(float tempDHT, float humDHT, float tempDS) {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SH110X_WHITE);
-  display.setCursor(0, 0);
-  display.print("Welcome ");
-  display.print(username);
-  display.setCursor(0, 20);
-  display.print("Temp: ");
-  display.print(tempDHT);
-  display.print(" C");
-  display.setCursor(0, 30);
-  display.print("Humidity: ");
-  display.print(humDHT);
-  display.print(" %");
-  display.setCursor(0, 40);
-  display.print("DS18B20 Temp: ");
-  display.print(tempDS);
-  display.print(" C");
-  display.display();
 }
