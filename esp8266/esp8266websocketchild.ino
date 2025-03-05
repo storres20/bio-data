@@ -24,7 +24,7 @@ using namespace websockets;
 
 /* 05/03/2025 10:06 Now I'm deploying on RAILWAY */
 const char* serverIP = "bio-data-production.up.railway.app";
-const uint16_t serverPort = 3002;
+//const uint16_t serverPort = 3002;
 
 DHT dht(DHTPIN, DHTTYPE);
 OneWire oneWire(ONE_WIRE_BUS);
@@ -116,7 +116,7 @@ void setup() {
   webSocket.onMessage(webSocketMessage);
   webSocket.onEvent(webSocketEvent);
   webSocket.setInsecure();
-  String wsUrl = "wss://" + String(serverIP) + ":" + String(serverPort) + "/";
+  String wsUrl = "wss://" + String(serverIP) + "/";
   webSocket.connect(wsUrl);
 }
 
