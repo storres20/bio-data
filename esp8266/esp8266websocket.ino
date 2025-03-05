@@ -24,7 +24,8 @@ using namespace websockets;
 #define USERNAME_ADDR 0  // Starting address for the username
 
 // Replace with your server IP and port
-const char* serverIP = "temphu.website101.xyz";  // Backend server domain
+/* 05/03/2025 10:06 Now I'm deploying on RAILWAY */
+const char* serverIP = "bio-data-production.up.railway.app";  // Backend server domain on RAILWAY
 const uint16_t serverPort = 3002;                // Backend server port
 
 DHT dht(DHTPIN, DHTTYPE);

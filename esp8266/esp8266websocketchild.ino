@@ -22,7 +22,8 @@ using namespace websockets;
 #define EEPROM_SIZE 32
 #define USERNAME_ADDR 0
 
-const char* serverIP = "temphu.website101.xyz";
+/* 05/03/2025 10:06 Now I'm deploying on RAILWAY */
+const char* serverIP = "bio-data-production.up.railway.app";
 const uint16_t serverPort = 3002;
 
 DHT dht(DHTPIN, DHTTYPE);
