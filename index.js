@@ -5,6 +5,7 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const WebSocket = require('ws'); // WebSocket server
 const datas = require('./routes/data.routes'); // Existing data routes
+const authRoutes = require('./routes/auth.routes'); // Import new route
 
 // Database connection - MongoDB
 const mongoString = process.env.DATABASE_URL;
@@ -37,6 +38,7 @@ app.get("/", (req, res) => {
 
 // Routes
 app.use('/api/v1/datas', datas);
+app.use('/api/auth', authRoutes); // Add authentication routes
 
 // Create HTTP server (Railway will handle SSL)
 const server = app.listen(3002, () => {
