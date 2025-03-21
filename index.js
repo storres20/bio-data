@@ -1,13 +1,14 @@
 require('dotenv').config();
 
-const express = require('express'); // Express server
+const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
-const WebSocket = require('ws'); // WebSocket server
-const datas = require('./routes/data.routes'); // Existing data routes
-const authRoutes = require('./routes/auth.routes'); // Import new route
+const WebSocket = require('ws');
+const http = require('http'); // Needed for raw server
+const datas = require('./routes/data.routes');
+const authRoutes = require('./routes/auth.routes');
 
-// Database connection - MongoDB
+// === MongoDB Setup ===
 const mongoString = process.env.DATABASE_URL;
 mongoose.set("strictQuery", false);
 mongoose.connect(mongoString, { dbName: "bio-data" });
@@ -16,65 +17,67 @@ const database = mongoose.connection;
 database.on('error', (error) => {
     console.log(error);
 });
-
 database.once('connected', () => {
     console.log('Database Connected');
 });
 
-// Express server
+// === Express Setup ===
 const app = express();
 app.use(express.json());
+app.use(cors({ origin: "*" }));
 
-// CORS options
-const corsOptions = {
-    origin: "*", // Allow all origins
-};
-app.use(cors(corsOptions));
-
-// Simple route
 app.get("/", (req, res) => {
     res.json({ message: "Welcome to Bio-Data Back-End application." });
 });
 
-// Routes
 app.use('/api/v1/datas', datas);
-app.use('/api/auth', authRoutes); // Add authentication routes
+app.use('/api/auth', authRoutes);
 
-// Create HTTP server (Railway will handle SSL)
-const server = app.listen(3002, () => {
-    console.log(`Server started at port 3002`);
+// === Create raw HTTP server ===
+const server = http.createServer(app);
+
+// === Create WebSocket server with noServer ===
+const wss = new WebSocket.Server({ noServer: true });
+
+// === Handle WebSocket upgrade manually ===
+server.on('upgrade', (request, socket, head) => {
+    console.log("📡 Upgrade request for WebSocket");
+
+    // Accept all clients (no mask validation)
+    wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request);
+    });
 });
 
-// WebSocket server
-const wss = new WebSocket.Server({ server });
-
-// WebSocket connection handling
+// === WebSocket logic ===
 wss.on('connection', (ws) => {
-    console.log('New WebSocket connection established');
+    console.log('✅ New WebSocket connection established');
 
-    // Listen for incoming messages
     ws.on('message', async (message) => {
-        console.log('Received message:', message);
+        console.log('📨 Received message:', message);
 
         try {
-            // Parse the incoming WebSocket message as JSON
             const data = JSON.parse(message);
-            console.log('Parsed Data:', data);
+            console.log('🔍 Parsed Data:', data);
 
-            // Broadcast the data back to all connected WebSocket clients
+            // Broadcast to all connected clients
             wss.clients.forEach((client) => {
                 if (client.readyState === WebSocket.OPEN) {
                     client.send(JSON.stringify(data));
                 }
             });
-
         } catch (error) {
-            console.error('Error parsing message:', error);
+            console.error('❌ Error parsing message:', error);
         }
     });
 
-    // Handle WebSocket disconnection
     ws.on('close', () => {
-        console.log('WebSocket connection closed');
+        console.log('🔌 WebSocket connection closed');
     });
+});
+
+// === Start HTTP server ===
+const PORT = 3002;
+server.listen(PORT, () => {
+    console.log(`🚀 Server listening on port ${PORT}`);
 });
