@@ -7,6 +7,8 @@ const WebSocket = require('ws');
 const http = require('http'); // Needed for raw server
 const datas = require('./routes/data.routes');
 const authRoutes = require('./routes/auth.routes');
+const devices = require('./routes/device.routes');
+
 
 // === MongoDB Setup ===
 const mongoString = process.env.DATABASE_URL;
@@ -32,6 +34,7 @@ app.get("/", (req, res) => {
 
 app.use('/api/v1/datas', datas);
 app.use('/api/auth', authRoutes);
+app.use('/api/devices', devices);
 
 // === Create raw HTTP server ===
 const server = http.createServer(app);
