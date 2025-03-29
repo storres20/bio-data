@@ -26,7 +26,11 @@ const deviceSchema = new mongoose.Schema({
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Area',
         required: true
-    }
+    },
+    assigned_sensor_username: {
+        type: String, // o el ID del ESP si prefieres
+        default: null,
+    },
 });
 
 module.exports = mongoose.model('Device', deviceSchema);
