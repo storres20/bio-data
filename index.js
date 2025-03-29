@@ -38,10 +38,7 @@ const server = http.createServer(app);
 
 // === WebSocket Setup ===
 const wss = new WebSocket.Server({ noServer: true });
-
-const latestDataPerSensor = new Map();  // username => last received data
-const lastSavedTimestamps = new Map();  // username => timestamp
-const initialSavedSensors = new Set();  // sensors that already saved their first data
+const latestDataPerSensor = new Map(); // 🔄 username => last received data
 
 server.on('upgrade', (req, socket, head) => {
     console.log("📡 Upgrade request for WebSocket");
@@ -58,41 +55,15 @@ wss.on('connection', (ws) => {
             const data = JSON.parse(message);
             if (!data.username) return;
 
-            // ⏺️ Save the latest data from this sensor
+            // ⏺️ Guardamos los últimos datos por sensor
             latestDataPerSensor.set(data.username, data);
 
-            const now = Date.now();
-            const lastSaved = lastSavedTimestamps.get(data.username) || 0;
-            const elapsedTime = now - lastSaved;
-
-            // 🔍 Find assigned device
-            const device = await Device.findOne({ assigned_sensor_username: data.username });
-
-            // ✅ Save immediately if it's the first message from this sensor
-            if (!initialSavedSensors.has(data.username)) {
-                const mongoData = new Data({
-                    temperature: data.temperature,
-                    humidity: data.humidity,
-                    dsTemperature: data.dsTemperature,
-                    username: data.username,
-                    datetime: data.datetime,
-                    device_id: device ? device._id : null,
-                });
-
-                await mongoData.save();
-                console.log(`🆕 Initial data saved for ${data.username}`);
-
-                lastSavedTimestamps.set(data.username, now);
-                initialSavedSensors.add(data.username);
-            }
-
-            // 🔁 Broadcast to all connected clients
+            // 🔁 Reenviamos a todos los clientes conectados
             wss.clients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) {
                     client.send(JSON.stringify(data));
                 }
             });
-
         } catch (err) {
             console.error('❌ Error parsing message:', err.message);
         }
@@ -103,40 +74,31 @@ wss.on('connection', (ws) => {
     });
 });
 
-// === Save in MongoDB every 10 minutes for all sensors ===
+// === Guardar en MongoDB cada 10 minutos los últimos datos de cada sensor conectado ===
 setInterval(async () => {
-    console.log('⏳ Saving latest data for all sensors...');
+    console.log('⏳ Saving all latest sensor data to DB...');
 
     for (const [username, data] of latestDataPerSensor.entries()) {
         try {
-            const now = Date.now();
-            const lastSaved = lastSavedTimestamps.get(username) || 0;
+            const device = await Device.findOne({ assigned_sensor_username: username });
 
-            if (now - lastSaved >= 10 * 60 * 1000) {
-                const device = await Device.findOne({ assigned_sensor_username: username });
+            const mongoData = new Data({
+                temperature: data.temperature,
+                humidity: data.humidity,
+                dsTemperature: data.dsTemperature,
+                username: username,
+                datetime: data.datetime,
+                device_id: device ? device._id : null,
+            });
 
-                const mongoData = new Data({
-                    temperature: data.temperature,
-                    humidity: data.humidity,
-                    dsTemperature: data.dsTemperature,
-                    username: username,
-                    datetime: data.datetime,
-                    device_id: device ? device._id : null,
-                });
-
-                await mongoData.save();
-                lastSavedTimestamps.set(username, now);
-                console.log(`✅ Saved in DB (10 min) for ${username}`);
-            } else {
-                console.log(`⏳ Skipping ${username} (last saved ${(Math.round((now - lastSaved) / 1000))} seconds ago)`);
-            }
-
+            await mongoData.save();
+            console.log(`✅ Saved in DB for ${username}`);
         } catch (err) {
             console.error(`❌ Error saving data for ${username}:`, err.message);
         }
     }
 
-}, 10 * 60 * 1000); // ✅ Every 10 minutes
+}, 600 * 1000); // ✅ Cada 10 minutos
 
 // === Start HTTP server ===
 const PORT = 3002;
