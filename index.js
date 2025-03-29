@@ -4,7 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const WebSocket = require('ws');
-const http = require('http'); // Needed for raw server
+const http = require('http');
 
 // === Import routes and models ===
 const datas = require('./routes/data.routes');
@@ -19,22 +19,16 @@ mongoose.set("strictQuery", false);
 mongoose.connect(mongoString, { dbName: "bio-data" });
 const database = mongoose.connection;
 
-database.on('error', (error) => {
-    console.log(error);
-});
-database.once('connected', () => {
-    console.log('Database Connected');
-});
+database.on('error', (error) => console.log(error));
+database.once('connected', () => console.log('✅ Database Connected'));
 
 // === Express Setup ===
 const app = express();
 app.use(express.json());
 app.use(cors({ origin: "*" }));
 
-app.get("/", (req, res) => {
-    res.json({ message: "Welcome to Bio-Data Back-End application." });
-});
-
+// === Routes ===
+app.get("/", (req, res) => res.json({ message: "Welcome to Bio-Data Back-End application." }));
 app.use('/api/v1/datas', datas);
 app.use('/api/auth', authRoutes);
 app.use('/api/devices', devices);
@@ -42,67 +36,36 @@ app.use('/api/devices', devices);
 // === Create raw HTTP server ===
 const server = http.createServer(app);
 
-// === Create WebSocket server with noServer ===
+// === WebSocket Setup ===
 const wss = new WebSocket.Server({ noServer: true });
+const latestDataPerSensor = new Map(); // 🔄 username => last received data
 
-// === Control: last saved timestamp per sensor ===
-const lastSavedTimestamps = new Map(); // username => timestamp
-
-// === Handle WebSocket upgrade manually ===
-server.on('upgrade', (request, socket, head) => {
+server.on('upgrade', (req, socket, head) => {
     console.log("📡 Upgrade request for WebSocket");
-
-    // Accept all clients (no mask validation)
-    wss.handleUpgrade(request, socket, head, (ws) => {
-        wss.emit('connection', ws, request);
+    wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit('connection', ws, req);
     });
 });
 
-// === WebSocket logic ===
 wss.on('connection', (ws) => {
     console.log('✅ New WebSocket connection established');
 
     ws.on('message', async (message) => {
-        console.log('📨 Received message:', message);
-
         try {
             const data = JSON.parse(message);
-            console.log('🔍 Parsed Data:', data);
+            if (!data.username) return;
 
-            const now = Date.now();
-            const lastSaved = lastSavedTimestamps.get(data.username) || 0;
-            const elapsedTime = now - lastSaved;
+            // ⏺️ Guardamos los últimos datos por sensor
+            latestDataPerSensor.set(data.username, data);
 
-            // 🔍 Find assigned device for this sensor
-            const device = await Device.findOne({ assigned_sensor_username: data.username });
-
-            // ✅ Save in MongoDB every 60 seconds per username
-            if (elapsedTime >= 60 * 1000) {
-                const mongoData = new Data({
-                    temperature: data.temperature,
-                    humidity: data.humidity,
-                    dsTemperature: data.dsTemperature,
-                    username: data.username,
-                    datetime: data.datetime,
-                    device_id: device ? device._id : null
-                });
-
-                await mongoData.save();
-                lastSavedTimestamps.set(data.username, now);
-                console.log(`✅ Saved in DB for ${data.username}`);
-            } else {
-                console.log(`⏳ Not saved in DB. Only ${Math.round(elapsedTime / 1000)}s passed.`);
-            }
-
-            // 🔁 Broadcast to all clients
-            wss.clients.forEach((client) => {
+            // 🔁 Reenviamos a todos los clientes conectados
+            wss.clients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) {
                     client.send(JSON.stringify(data));
                 }
             });
-
-        } catch (error) {
-            console.error('❌ Error handling message:', error.message);
+        } catch (err) {
+            console.error('❌ Error parsing message:', err.message);
         }
     });
 
@@ -110,6 +73,32 @@ wss.on('connection', (ws) => {
         console.log('🔌 WebSocket connection closed');
     });
 });
+
+// === Guardar en MongoDB cada 10 minutos los últimos datos de cada sensor conectado ===
+setInterval(async () => {
+    console.log('⏳ Saving all latest sensor data to DB...');
+
+    for (const [username, data] of latestDataPerSensor.entries()) {
+        try {
+            const device = await Device.findOne({ assigned_sensor_username: username });
+
+            const mongoData = new Data({
+                temperature: data.temperature,
+                humidity: data.humidity,
+                dsTemperature: data.dsTemperature,
+                username: username,
+                datetime: data.datetime,
+                device_id: device ? device._id : null,
+            });
+
+            await mongoData.save();
+            console.log(`✅ Saved in DB for ${username}`);
+        } catch (err) {
+            console.error(`❌ Error saving data for ${username}:`, err.message);
+        }
+    }
+
+}, 600 * 1000); // ✅ Cada 10 minutos
 
 // === Start HTTP server ===
 const PORT = 3002;
