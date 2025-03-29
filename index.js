@@ -5,10 +5,13 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const WebSocket = require('ws');
 const http = require('http'); // Needed for raw server
+
+// === Import routes and models ===
 const datas = require('./routes/data.routes');
 const authRoutes = require('./routes/auth.routes');
 const devices = require('./routes/device.routes');
-
+const Data = require('./models/data.model');
+const Device = require('./models/device.model');
 
 // === MongoDB Setup ===
 const mongoString = process.env.DATABASE_URL;
@@ -42,6 +45,9 @@ const server = http.createServer(app);
 // === Create WebSocket server with noServer ===
 const wss = new WebSocket.Server({ noServer: true });
 
+// === Control: last saved timestamp per sensor ===
+const lastSavedTimestamps = new Map(); // username => timestamp
+
 // === Handle WebSocket upgrade manually ===
 server.on('upgrade', (request, socket, head) => {
     console.log("📡 Upgrade request for WebSocket");
@@ -63,14 +69,40 @@ wss.on('connection', (ws) => {
             const data = JSON.parse(message);
             console.log('🔍 Parsed Data:', data);
 
-            // Broadcast to all connected clients
+            const now = Date.now();
+            const lastSaved = lastSavedTimestamps.get(data.username) || 0;
+            const elapsedTime = now - lastSaved;
+
+            // 🔍 Find assigned device for this sensor
+            const device = await Device.findOne({ assigned_sensor_username: data.username });
+
+            // ✅ Save in MongoDB every 60 seconds per username
+            if (elapsedTime >= 60 * 1000) {
+                const mongoData = new Data({
+                    temperature: data.temperature,
+                    humidity: data.humidity,
+                    dsTemperature: data.dsTemperature,
+                    username: data.username,
+                    datetime: data.datetime,
+                    device_id: device ? device._id : null
+                });
+
+                await mongoData.save();
+                lastSavedTimestamps.set(data.username, now);
+                console.log(`✅ Saved in DB for ${data.username}`);
+            } else {
+                console.log(`⏳ Not saved in DB. Only ${Math.round(elapsedTime / 1000)}s passed.`);
+            }
+
+            // 🔁 Broadcast to all clients
             wss.clients.forEach((client) => {
                 if (client.readyState === WebSocket.OPEN) {
                     client.send(JSON.stringify(data));
                 }
             });
+
         } catch (error) {
-            console.error('❌ Error parsing message:', error);
+            console.error('❌ Error handling message:', error.message);
         }
     });
 
