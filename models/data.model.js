@@ -20,6 +20,10 @@ const dataSchema = new mongoose.Schema({
     datetime: {
         required: true,
         type: Date
+    },
+    device_id: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Device'
     }
 })
 
