@@ -72,9 +72,13 @@ wss.on('connection', (ws) => {
     ws.on('close', () => {
         console.log('🔌 WebSocket connection closed');
     });
+
+    ws.on('error', (error) => {
+        console.error('⚠️ WebSocket Error:', error.message);
+    });
 });
 
-// === Guardar en MongoDB cada 10 minutos los últimos datos de cada sensor conectado ===
+// === Save in MongoDB every 10 minutes the latest data of each sensor ===
 setInterval(async () => {
     console.log('⏳ Saving all latest sensor data to DB...');
 
@@ -101,7 +105,7 @@ setInterval(async () => {
 }, 600 * 1000); // ✅ Cada 10 minutos
 
 // === Start HTTP server ===
-const PORT = 3002;
+const PORT = process.env.PORT || 3000; // 🛠️ Usa el puerto que Railway te da
 server.listen(PORT, () => {
     console.log(`🚀 Server listening on port ${PORT}`);
 });
