@@ -83,25 +83,32 @@ router.get('/usernames', async (req, res) => {
     }
 });
 
-// Get data by device_id (with optional date range)
 router.get('/by-device/:deviceId', async (req, res) => {
-    try {
-        const { deviceId } = req.params;
-        const { from, to } = req.query;
+    const { deviceId } = req.params;
+    const { from, to } = req.query;
 
-        const query = { device_id: deviceId };
+    const filter = { device_id: deviceId };
 
-        if (from && to) {
-            const fromDate = new Date(`${from}T00:00:00-05:00`);
-            const toDate = new Date(`${to}T23:59:59-05:00`);
-            query.datetime = { $gte: fromDate, $lte: toDate };
+    if (from && to) {
+        const fromDate = new Date(from);
+        const toDate = new Date(to);
+
+        if (isNaN(fromDate.getTime()) || isNaN(toDate.getTime())) {
+            return res.status(400).json({ message: 'Invalid date format' });
         }
 
-        const data = await Model.find(query).sort({ datetime: 1 });
+        filter.datetime = {
+            $gte: fromDate,
+            $lte: toDate,
+        };
+    }
 
-        res.status(200).json(data);
-    } catch (error) {
-        res.status(500).json({ message: error.message });
+    try {
+        const results = await Data.find(filter).sort({ datetime: 1 });
+        res.json(results);
+    } catch (err) {
+        console.error('❌ Error fetching data by device:', err.message);
+        res.status(500).json({ message: 'Internal server error' });
     }
 });
 
