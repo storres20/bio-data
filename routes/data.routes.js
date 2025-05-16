@@ -104,7 +104,7 @@ router.get('/by-device/:deviceId', async (req, res) => {
     }
 
     try {
-        const results = await Data.find(filter).sort({ datetime: 1 });
+        const results = await Model.find(filter).sort({ datetime: 1 });
         res.json(results);
     } catch (err) {
         console.error('❌ Error fetching data by device:', err.message);
