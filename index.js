@@ -52,12 +52,13 @@ wss.on('connection', (ws) => {
     let username = null;
 
     // Timeout si no se recibe username
-    const authTimeout = setTimeout(() => {
+    let authTimeout = setTimeout(() => {
         if (!username) {
-            console.warn('⏱️ Desconectado por no enviar username a tiempo');
-            ws.terminate();
+            console.warn('⏱️ Cliente no identificado en 10s (probablemente frontend). Se mantiene conexión solo lectura');
+            clearTimeout(authTimeout); // importante!
+            authTimeout = null;
         }
-    }, 10000); // 10 segundos
+    }, 10000);
 
     ws.isAlive = true;
 
