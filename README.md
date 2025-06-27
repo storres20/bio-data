@@ -1,6 +1,6 @@
-# TEMPHU Backend Server
+# MHUTEMP Backend Server
 
-This is the backend server of the **TEMPHU** project, responsible for receiving environmental data from ESP8266 devices and storing it in a MongoDB database.
+This is the backend server of the **MHUTEMP** project, responsible for receiving environmental data from ESP8266 devices and storing it in a MongoDB database.
 
 ## 🚀 Features
 
@@ -39,7 +39,7 @@ pnpm start
 
 ## 📚 Related Repositories
 
-- [TEMPHU Frontend Application (Next.js)](https://github.com/storres20/bio-data-nextjs)
+- [MHUTEMP Frontend Application (Next.js)](https://github.com/storres20/bio-data-nextjs)
 
 ## 📜 License
 
