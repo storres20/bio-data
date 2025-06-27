@@ -38,7 +38,7 @@ const server = http.createServer(app);
 
 // === WebSocket Setup ===
 const wss = new WebSocket.Server({ noServer: true });
-const latestDataPerSensor = new Map(); // 🔄 username => last received data
+const latestDataPerSensor = new Map(); // 🔄 username => { data, lastReceivedAt, lastSavedDatetime }
 
 server.on('upgrade', (req, socket, head) => {
     console.log("📡 Upgrade request for WebSocket");
@@ -49,40 +49,105 @@ server.on('upgrade', (req, socket, head) => {
 
 wss.on('connection', (ws) => {
     console.log('✅ New WebSocket connection established');
+    let username = null;
+
+    // Timeout si no se recibe username
+    const authTimeout = setTimeout(() => {
+        if (!username) {
+            console.warn('⏱️ Desconectado por no enviar username a tiempo');
+            ws.terminate();
+        }
+    }, 10000); // 10 segundos
+
+    ws.isAlive = true;
 
     ws.on('message', async (message) => {
         try {
-            const data = JSON.parse(message);
-            if (!data.username) return;
+            const parsed = JSON.parse(message);
+            if (!parsed.username) return;
 
-            // ⏺️ Guardamos los últimos datos por sensor
-            latestDataPerSensor.set(data.username, data);
+            username = parsed.username;
+            ws.username = username;
+            ws.isAlive = true;
 
-            // 🔁 Reenviamos a todos los clientes conectados
+            clearTimeout(authTimeout);
+
+            const currentEntry = latestDataPerSensor.get(username);
+            const lastDatetime = currentEntry?.data?.datetime;
+
+            // Solo guarda si es un datetime distinto
+            if (parsed.datetime !== lastDatetime) {
+                latestDataPerSensor.set(username, {
+                    data: parsed,
+                    lastReceivedAt: Date.now()
+                });
+            }
+
+            // Reenviar a todos los clientes conectados
             wss.clients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) {
-                    client.send(JSON.stringify(data));
+                    client.send(JSON.stringify(parsed));
                 }
             });
+
         } catch (err) {
             console.error('❌ Error parsing message:', err.message);
         }
     });
 
+    ws.on('pong', () => {
+        ws.isAlive = true;
+        console.log(`📡 Pong recibido de ${ws.username ?? 'cliente desconocido'}`);
+    });
+
+    ws.on('ping', () => {
+        console.log(`📶 Ping recibido de ${ws.username ?? 'cliente desconocido'}`);
+    });
+
     ws.on('close', () => {
-        console.log('🔌 WebSocket connection closed');
+        console.log(`🔌 WebSocket cerrado para ${ws.username ?? 'cliente desconocido'}`);
     });
 
     ws.on('error', (error) => {
-        console.error('⚠️ WebSocket Error:', error.message);
+        console.error(`⚠️ Error en WebSocket (${ws.username ?? 'cliente desconocido'}): ${error.message}`);
     });
 });
 
-// === Save in MongoDB every 10 minutes the latest data of each sensor ===
-setInterval(async () => {
-    console.log('⏳ Saving all latest sensor data to DB...');
+// === Ping a los clientes cada 30 segundos y cerrar si no responden ===
+setInterval(() => {
+    wss.clients.forEach(ws => {
+        if (!ws.isAlive) {
+            console.warn(`💀 ${ws.username ?? 'Cliente'} sin respuesta. Cerrando WebSocket...`);
+            return ws.terminate();
+        }
+        ws.isAlive = false;
+        ws.ping(() => {});
+        console.log(`📤 Ping enviado desde backend a ${ws.username ?? 'cliente desconocido'}`);
+    });
+}, 30000);
 
-    for (const [username, data] of latestDataPerSensor.entries()) {
+// === Guardar en MongoDB cada 10 minutos solo si hay datos recientes y distintos ===
+setInterval(async () => {
+    console.log('⏳ Guardando datos recientes en MongoDB...');
+
+    const now = Date.now();
+
+    for (const [username, entry] of latestDataPerSensor.entries()) {
+        const { data, lastReceivedAt, lastSavedDatetime } = entry;
+
+        // No guardar si hace más de 5 minutos que no se recibe nada nuevo
+        if (now - lastReceivedAt > 5 * 60 * 1000) {
+            console.warn(`⚠️ Sensor ${username} inactivo. Se omite guardado`);
+            latestDataPerSensor.delete(username);
+            continue;
+        }
+
+        // No guardar si ya se guardó el mismo datetime
+        if (data.datetime === lastSavedDatetime) {
+            console.log(`ℹ️ Ya se guardó el dato de ${username} con el mismo datetime`);
+            continue;
+        }
+
         try {
             const device = await Device.findOne({ assigned_sensor_username: username });
 
@@ -96,16 +161,23 @@ setInterval(async () => {
             });
 
             await mongoData.save();
-            console.log(`✅ Saved in DB for ${username}`);
+
+            // Actualizar último datetime guardado
+            latestDataPerSensor.set(username, {
+                ...entry,
+                lastSavedDatetime: data.datetime
+            });
+
+            console.log(`✅ Guardado en DB para ${username}`);
         } catch (err) {
-            console.error(`❌ Error saving data for ${username}:`, err.message);
+            console.error(`❌ Error guardando ${username}:`, err.message);
         }
     }
 
-}, 600 * 1000); // ✅ Cada 10 minutos
+}, 10 * 60 * 1000); // cada 10 minutos
 
 // === Start HTTP server ===
-const PORT = process.env.PORT || 3000; // 🛠️ Usa el puerto que Railway te da
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`🚀 Server listening on port ${PORT}`);
 });
