@@ -12,6 +12,7 @@ const authRoutes = require('./routes/auth.routes');
 const devices = require('./routes/device.routes');
 const Data = require('./models/data.model');
 const Device = require('./models/device.model');
+const Simulation = require('./models/simulation.model'); // ✅ nuevo modelo
 
 // === MongoDB Setup ===
 const mongoString = process.env.DATABASE_URL;
@@ -32,6 +33,16 @@ app.get("/", (req, res) => res.json({ message: "Welcome to Bio-Data Back-End app
 app.use('/api/v1/datas', datas);
 app.use('/api/auth', authRoutes);
 app.use('/api/devices', devices);
+
+// ✅ Ruta nueva para consultar simuladores activos
+app.get('/api/simulations', async (req, res) => {
+    try {
+        const sims = await Simulation.find({}, 'username');
+        res.json(sims);
+    } catch (err) {
+        res.status(500).json({ error: 'Error fetching simulations' });
+    }
+});
 
 // === Create raw HTTP server ===
 const server = http.createServer(app);
@@ -55,7 +66,7 @@ wss.on('connection', (ws) => {
     let authTimeout = setTimeout(() => {
         if (!username) {
             console.warn('⏱️ Cliente no identificado en 10s (probablemente frontend). Se mantiene conexión solo lectura');
-            clearTimeout(authTimeout); // importante!
+            clearTimeout(authTimeout);
             authTimeout = null;
         }
     }, 10000);
@@ -76,7 +87,6 @@ wss.on('connection', (ws) => {
             const currentEntry = latestDataPerSensor.get(username);
             const lastDatetime = currentEntry?.data?.datetime;
 
-            // Solo guarda si es un datetime distinto
             if (parsed.datetime !== lastDatetime) {
                 latestDataPerSensor.set(username, {
                     data: parsed,
@@ -84,7 +94,6 @@ wss.on('connection', (ws) => {
                 });
             }
 
-            // Reenviar a todos los clientes conectados
             wss.clients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) {
                     client.send(JSON.stringify(parsed));
@@ -114,7 +123,6 @@ wss.on('connection', (ws) => {
     });
 });
 
-// === Ping a los clientes cada 30 segundos y cerrar si no responden ===
 setInterval(() => {
     wss.clients.forEach(ws => {
         if (!ws.isAlive) {
@@ -127,7 +135,6 @@ setInterval(() => {
     });
 }, 30000);
 
-// === Guardar en MongoDB cada 10 minutos solo si hay datos recientes y distintos ===
 setInterval(async () => {
     console.log('⏳ Guardando datos recientes en MongoDB...');
 
@@ -136,14 +143,12 @@ setInterval(async () => {
     for (const [username, entry] of latestDataPerSensor.entries()) {
         const { data, lastReceivedAt, lastSavedDatetime } = entry;
 
-        // No guardar si hace más de 5 minutos que no se recibe nada nuevo
         if (now - lastReceivedAt > 5 * 60 * 1000) {
             console.warn(`⚠️ Sensor ${username} inactivo. Se omite guardado`);
             latestDataPerSensor.delete(username);
             continue;
         }
 
-        // No guardar si ya se guardó el mismo datetime
         if (data.datetime === lastSavedDatetime) {
             console.log(`ℹ️ Ya se guardó el dato de ${username} con el mismo datetime`);
             continue;
@@ -163,7 +168,6 @@ setInterval(async () => {
 
             await mongoData.save();
 
-            // Actualizar último datetime guardado
             latestDataPerSensor.set(username, {
                 ...entry,
                 lastSavedDatetime: data.datetime
@@ -175,9 +179,8 @@ setInterval(async () => {
         }
     }
 
-}, 10 * 60 * 1000); // cada 10 minutos
+}, 10 * 60 * 1000);
 
-// === Start HTTP server ===
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`🚀 Server listening on port ${PORT}`);
