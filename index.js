@@ -6,7 +6,6 @@ const mongoose = require('mongoose');
 const WebSocket = require('ws');
 const http = require('http');
 
-// === Import routes and models ===
 const datas = require('./routes/data.routes');
 const authRoutes = require('./routes/auth.routes');
 const devices = require('./routes/device.routes');
@@ -14,7 +13,6 @@ const Data = require('./models/data.model');
 const Device = require('./models/device.model');
 const Simulation = require('./models/simulation.model');
 
-// === MongoDB Setup ===
 const mongoString = process.env.DATABASE_URL;
 mongoose.set("strictQuery", false);
 mongoose.connect(mongoString, { dbName: "bio-data" });
@@ -23,12 +21,10 @@ const database = mongoose.connection;
 database.on('error', (error) => console.log(error));
 database.once('connected', () => console.log('✅ Database Connected'));
 
-// === Express Setup ===
 const app = express();
 app.use(express.json());
 app.use(cors({ origin: "*" }));
 
-// === Routes ===
 app.get("/", (req, res) => res.json({ message: "Welcome to Bio-Data Back-End application." }));
 app.use('/api/v1/datas', datas);
 app.use('/api/auth', authRoutes);
@@ -43,12 +39,10 @@ app.get('/api/simulations', async (req, res) => {
     }
 });
 
-// === Create raw HTTP server ===
 const server = http.createServer(app);
-
-// === WebSocket Setup ===
 const wss = new WebSocket.Server({ noServer: true });
 const latestDataPerSensor = new Map();
+const userConnections = new Map();  // username => Set<WebSocket>
 
 server.on('upgrade', (req, socket, head) => {
     console.log("📡 Upgrade request for WebSocket");
@@ -76,11 +70,19 @@ wss.on('connection', (ws) => {
             const parsed = JSON.parse(message);
             if (!parsed.username) return;
 
-            username = parsed.username;
-            ws.username = username;
-            ws.isAlive = true;
+            if (!username) {
+                username = parsed.username;
+                ws.username = username;
+                clearTimeout(authTimeout);
 
-            clearTimeout(authTimeout);
+                if (!userConnections.has(username)) {
+                    userConnections.set(username, new Set());
+                }
+                userConnections.get(username).add(ws);
+                console.log(`➕ WebSocket añadido para ${username}`);
+            }
+
+            ws.isAlive = true;
 
             const currentEntry = latestDataPerSensor.get(username);
             const lastDatetime = currentEntry?.data?.datetime;
@@ -92,7 +94,6 @@ wss.on('connection', (ws) => {
                 });
             }
 
-            // Reenvía datos a todos los clientes conectados
             wss.clients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) {
                     client.send(JSON.stringify(parsed));
@@ -114,11 +115,18 @@ wss.on('connection', (ws) => {
     });
 
     ws.on('close', () => {
-        console.log(`🔌 WebSocket cerrado para ${ws.username ?? 'cliente desconocido'}`);
+        if (username && userConnections.has(username)) {
+            userConnections.get(username).delete(ws);
+            if (userConnections.get(username).size === 0) {
+                userConnections.delete(username);
+            }
+            console.log(`➖ WebSocket eliminado para ${username}`);
+        }
+        console.log(`🔌 WebSocket cerrado para ${username ?? 'cliente desconocido'}`);
     });
 
     ws.on('error', (error) => {
-        console.error(`⚠️ Error en WebSocket (${ws.username ?? 'cliente desconocido'}): ${error.message}`);
+        console.error(`⚠️ Error en WebSocket (${username ?? 'cliente desconocido'}): ${error.message}`);
     });
 });
 
@@ -146,7 +154,6 @@ setInterval(() => {
 // 💾 Guardar datos recientes en MongoDB cada 10 min
 setInterval(async () => {
     console.log('⏳ Guardando datos recientes en MongoDB...');
-
     const now = Date.now();
 
     for (const [username, entry] of latestDataPerSensor.entries()) {
