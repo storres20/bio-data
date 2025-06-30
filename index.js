@@ -12,7 +12,7 @@ const authRoutes = require('./routes/auth.routes');
 const devices = require('./routes/device.routes');
 const Data = require('./models/data.model');
 const Device = require('./models/device.model');
-const Simulation = require('./models/simulation.model'); // ✅ nuevo modelo
+const Simulation = require('./models/simulation.model');
 
 // === MongoDB Setup ===
 const mongoString = process.env.DATABASE_URL;
@@ -34,7 +34,6 @@ app.use('/api/v1/datas', datas);
 app.use('/api/auth', authRoutes);
 app.use('/api/devices', devices);
 
-// ✅ Ruta nueva para consultar simuladores activos
 app.get('/api/simulations', async (req, res) => {
     try {
         const sims = await Simulation.find({}, 'username');
@@ -49,7 +48,7 @@ const server = http.createServer(app);
 
 // === WebSocket Setup ===
 const wss = new WebSocket.Server({ noServer: true });
-const latestDataPerSensor = new Map(); // 🔄 username => { data, lastReceivedAt, lastSavedDatetime }
+const latestDataPerSensor = new Map();
 
 server.on('upgrade', (req, socket, head) => {
     console.log("📡 Upgrade request for WebSocket");
@@ -62,12 +61,11 @@ wss.on('connection', (ws) => {
     console.log('✅ New WebSocket connection established');
     let username = null;
 
-    // Timeout si no se recibe username
-    let authTimeout = setTimeout(() => {
+    // 🛡️ Cierra conexiones que no se identifican en 10 segundos
+    const authTimeout = setTimeout(() => {
         if (!username) {
-            console.warn('⏱️ Cliente no identificado en 10s (probablemente frontend). Se mantiene conexión solo lectura');
-            clearTimeout(authTimeout);
-            authTimeout = null;
+            console.warn('⏱️ Cliente no identificado. Cerrando WebSocket por seguridad.');
+            ws.close();
         }
     }, 10000);
 
@@ -94,6 +92,7 @@ wss.on('connection', (ws) => {
                 });
             }
 
+            // Reenvía datos a todos los clientes conectados
             wss.clients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) {
                     client.send(JSON.stringify(parsed));
@@ -123,7 +122,9 @@ wss.on('connection', (ws) => {
     });
 });
 
+// 🔄 PING cada 30 segundos para comprobar que los clientes están vivos
 setInterval(() => {
+    console.log('📋 Verificando conexiones WebSocket...');
     wss.clients.forEach(ws => {
         if (!ws.isAlive) {
             console.warn(`💀 ${ws.username ?? 'Cliente'} sin respuesta. Cerrando WebSocket...`);
@@ -135,6 +136,14 @@ setInterval(() => {
     });
 }, 30000);
 
+// 🧾 Mostrar lista de clientes activos cada 30s
+setInterval(() => {
+    const connected = [];
+    wss.clients.forEach(ws => connected.push(ws.username ?? 'cliente desconocido'));
+    console.log('🔍 Clientes activos:', connected);
+}, 30000);
+
+// 💾 Guardar datos recientes en MongoDB cada 10 min
 setInterval(async () => {
     console.log('⏳ Guardando datos recientes en MongoDB...');
 
