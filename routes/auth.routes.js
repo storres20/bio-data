@@ -1,7 +1,6 @@
 const express = require('express');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
-const mongoose = require('mongoose');
 const User = require('../models/user.model');
 const Hospital = require('../models/hospital.model');
 const Area = require('../models/area.model');
@@ -69,6 +68,28 @@ router.post('/login', async (req, res) => {
         });
     } catch (error) {
         res.status(500).json({ message: error.message });
+    }
+});
+
+// Get all hospitals
+router.get('/hospitals', async (req, res) => {
+    try {
+        const hospitals = await Hospital.find().select('_id name');
+        res.status(200).json(hospitals);
+    } catch (error) {
+        console.error('Error fetching hospitals:', error);
+        res.status(500).json({ message: 'Error fetching hospitals' });
+    }
+});
+
+// Get all areas
+router.get('/areas', async (req, res) => {
+    try {
+        const areas = await Area.find().select('_id name');
+        res.status(200).json(areas);
+    } catch (error) {
+        console.error('Error fetching areas:', error);
+        res.status(500).json({ message: 'Error fetching areas' });
     }
 });
 
