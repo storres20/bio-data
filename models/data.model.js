@@ -28,6 +28,19 @@ const dataSchema = new mongoose.Schema({
     doorStatus: {
         required: true,
         type: String
+    },
+    // ========================================
+    // ✨ NUEVOS CAMPOS para lógica de puerta
+    // ========================================
+    sampling_rate: {
+        type: String,
+        enum: ['1min', '10min'],
+        default: '10min'
+    },
+    door_event_id: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'DoorEvent',
+        default: null
     }
 })
 
