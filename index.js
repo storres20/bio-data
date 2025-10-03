@@ -180,6 +180,7 @@ setInterval(async () => {
                 username: username,
                 datetime: data.datetime,
                 device_id: device ? device._id : null,
+                doorStatus: data.doorStatus,
             });
 
             await mongoData.save();

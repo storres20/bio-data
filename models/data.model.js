@@ -24,6 +24,10 @@ const dataSchema = new mongoose.Schema({
     device_id: {
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Device'
+    },
+    doorStatus: {
+        required: true,
+        type: String
     }
 })
 
