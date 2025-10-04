@@ -12,7 +12,7 @@ const devices = require('./routes/device.routes');
 const Data = require('./models/data.model');
 const Device = require('./models/device.model');
 const Simulation = require('./models/simulation.model');
-const DoorEvent = require('./models/door-event.model'); // ← NUEVO MODELO
+const DoorEvent = require('./models/door-event.model');
 
 const mongoString = process.env.DATABASE_URL;
 mongoose.set("strictQuery", false);
@@ -40,9 +40,6 @@ app.get('/api/simulations', async (req, res) => {
     }
 });
 
-// ========================================
-// ✨ NUEVO: Endpoint para eventos de puerta
-// ========================================
 app.get('/api/door-events/:username', async (req, res) => {
     try {
         const { username } = req.params;
@@ -65,11 +62,7 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 const latestDataPerSensor = new Map();
 const userConnections = new Map();
-
-// ========================================
-// ✨ NUEVO: Estado de control de puerta por sensor
-// ========================================
-const doorState = new Map(); // username => { status, lastSaveTime, samplingRate, currentEvent, tempBeforeOpen, recoveryMode }
+const doorState = new Map();
 
 server.on('upgrade', (req, socket, head) => {
     console.log("📡 Upgrade request for WebSocket");
@@ -90,6 +83,7 @@ wss.on('connection', (ws) => {
     }, 10000);
 
     ws.isAlive = true;
+    ws.lastMessageTime = Date.now(); // ← NUEVO: Inicializar timestamp
 
     ws.on('message', async (message) => {
         try {
@@ -107,14 +101,11 @@ wss.on('connection', (ws) => {
                 userConnections.get(username).add(ws);
                 console.log(`➕ WebSocket añadido para ${username}`);
 
-                // ========================================
-                // ✨ NUEVO: Inicializar estado de puerta
-                // ========================================
                 if (!doorState.has(username)) {
                     doorState.set(username, {
                         status: parsed.doorStatus || 'closed',
                         lastSaveTime: 0,
-                        samplingRate: 10 * 60 * 1000, // 10 minutos por defecto
+                        samplingRate: 10 * 60 * 1000,
                         currentEvent: null,
                         tempBeforeOpen: null,
                         recoveryMode: false
@@ -122,7 +113,9 @@ wss.on('connection', (ws) => {
                 }
             }
 
+            // ✅ CRÍTICO: Marcar como vivo con CUALQUIER mensaje (no solo pong)
             ws.isAlive = true;
+            ws.lastMessageTime = Date.now();
 
             const currentEntry = latestDataPerSensor.get(username);
             const lastDatetime = currentEntry?.data?.datetime;
@@ -134,9 +127,6 @@ wss.on('connection', (ws) => {
                 });
             }
 
-            // ========================================
-            // ✨ NUEVO: Detectar cambios de estado de puerta
-            // ========================================
             await handleDoorStatusChange(username, parsed);
 
             wss.clients.forEach(client => {
@@ -152,6 +142,7 @@ wss.on('connection', (ws) => {
 
     ws.on('pong', () => {
         ws.isAlive = true;
+        ws.lastMessageTime = Date.now();
         console.log(`📡 Pong recibido de ${ws.username ?? 'cliente desconocido'}`);
     });
 
@@ -175,35 +166,31 @@ wss.on('connection', (ws) => {
     });
 });
 
-// ========================================
-// ✨ NUEVA FUNCIÓN: Manejar cambios de estado de puerta
-// ========================================
 async function handleDoorStatusChange(username, data) {
     const state = doorState.get(username);
     if (!state) return;
 
+    // Si no tiene doorStatus (simuladores antiguos), solo guardar normalmente
+    if (!data.doorStatus) {
+        await checkAndSaveData(username, data);
+        return;
+    }
+
     const currentStatus = data.doorStatus;
     const previousStatus = state.status;
 
-    // No hay cambio de estado
     if (currentStatus === previousStatus) {
-        // Verificar si toca guardar según la frecuencia actual
         await checkAndSaveData(username, data);
         return;
     }
 
     console.log(`🚪 ${username}: Cambio de estado ${previousStatus} → ${currentStatus}`);
 
-    // ========================================
-    // 🚪 PUERTA SE ABRIÓ
-    // ========================================
     if (currentStatus === 'open' && previousStatus === 'closed') {
         console.log(`🔓 ${username}: PUERTA ABIERTA - Iniciando monitoreo intensivo`);
 
-        // Guardar snapshot inmediato
         await saveDataToMongo(username, data, '1min', null);
 
-        // Crear nuevo evento de puerta
         try {
             const device = await Device.findOne({ assigned_sensor_username: username });
 
@@ -221,7 +208,7 @@ async function handleDoorStatusChange(username, data) {
 
             state.currentEvent = newEvent._id;
             state.tempBeforeOpen = parseFloat(data.dsTemperature);
-            state.samplingRate = 1 * 60 * 1000; // Cambiar a 1 minuto
+            state.samplingRate = 1 * 60 * 1000;
             state.lastSaveTime = Date.now();
             state.recoveryMode = false;
 
@@ -231,21 +218,16 @@ async function handleDoorStatusChange(username, data) {
         }
     }
 
-        // ========================================
-        // 🚪 PUERTA SE CERRÓ
-    // ========================================
     else if (currentStatus === 'closed' && previousStatus === 'open') {
         console.log(`🔒 ${username}: PUERTA CERRADA - Iniciando modo recuperación`);
 
-        // Guardar snapshot inmediato
         await saveDataToMongo(username, data, '1min', state.currentEvent);
 
-        // Actualizar evento de puerta
         if (state.currentEvent) {
             try {
                 const openedEvent = await DoorEvent.findById(state.currentEvent);
                 if (openedEvent) {
-                    const duration = (new Date(data.datetime) - openedEvent.opened_at) / 1000; // segundos
+                    const duration = (new Date(data.datetime) - openedEvent.opened_at) / 1000;
 
                     openedEvent.closed_at = new Date(data.datetime);
                     openedEvent.temp_OUT_after = parseFloat(data.dsTemperature);
@@ -265,19 +247,14 @@ async function handleDoorStatusChange(username, data) {
             }
         }
 
-        // Mantener sampling de 1 min para recuperación
         state.recoveryMode = true;
         state.lastSaveTime = Date.now();
     }
 
-    // Actualizar estado
     state.status = currentStatus;
     doorState.set(username, state);
 }
 
-// ========================================
-// ✨ NUEVA FUNCIÓN: Verificar y guardar según frecuencia
-// ========================================
 async function checkAndSaveData(username, data) {
     const state = doorState.get(username);
     if (!state) return;
@@ -285,26 +262,20 @@ async function checkAndSaveData(username, data) {
     const now = Date.now();
     const timeSinceLastSave = now - state.lastSaveTime;
 
-    // Verificar si toca guardar según la frecuencia actual
     if (timeSinceLastSave >= state.samplingRate) {
         const samplingLabel = state.samplingRate === 600000 ? '10min' : '1min';
         await saveDataToMongo(username, data, samplingLabel, state.currentEvent);
         state.lastSaveTime = now;
 
-        // ========================================
-        // 🔍 VERIFICAR RECUPERACIÓN TÉRMICA
-        // ========================================
         if (state.recoveryMode && state.currentEvent && state.tempBeforeOpen !== null) {
             const tempDiff = Math.abs(parseFloat(data.dsTemperature) - state.tempBeforeOpen);
-            const tolerance = parseFloat(data.dsTemperature) < 15 ? 1.0 : 0.5; // °C (ajustable)
+            const tolerance = parseFloat(data.dsTemperature) < 15 ? 1.0 : 0.5;
 
             if (tempDiff <= tolerance) {
                 console.log(`✅ ${username}: TEMPERATURA ESTABILIZADA (Δ = ${tempDiff.toFixed(2)}°C) - Volviendo a modo normal`);
 
-                // Guardar snapshot final
                 await saveDataToMongo(username, data, '1min', state.currentEvent);
 
-                // Cerrar evento
                 try {
                     const event = await DoorEvent.findById(state.currentEvent);
                     if (event) {
@@ -324,24 +295,20 @@ async function checkAndSaveData(username, data) {
                     console.error(`❌ Error completando evento: ${err.message}`);
                 }
 
-                // Resetear a modo normal
-                state.samplingRate = 10 * 60 * 1000; // Volver a 10 minutos
+                state.samplingRate = 10 * 60 * 1000;
                 state.recoveryMode = false;
                 state.currentEvent = null;
                 state.tempBeforeOpen = null;
             }
         }
 
-        // ========================================
-        // ⚠️ TIMEOUT DE RECUPERACIÓN (30 min)
-        // ========================================
         if (state.recoveryMode && state.currentEvent) {
             try {
                 const event = await DoorEvent.findById(state.currentEvent);
                 if (event && event.closed_at) {
                     const timeSinceClosed = (Date.now() - new Date(event.closed_at).getTime()) / 1000;
 
-                    if (timeSinceClosed > 30 * 60) { // 30 minutos
+                    if (timeSinceClosed > 30 * 60) {
                         console.warn(`⚠️ ${username}: Recuperación térmica >30min - Forzando modo normal`);
 
                         event.stabilized_at = new Date(data.datetime);
@@ -353,7 +320,6 @@ async function checkAndSaveData(username, data) {
 
                         await event.save();
 
-                        // Resetear a modo normal
                         state.samplingRate = 10 * 60 * 1000;
                         state.recoveryMode = false;
                         state.currentEvent = null;
@@ -369,9 +335,6 @@ async function checkAndSaveData(username, data) {
     }
 }
 
-// ========================================
-// ✨ NUEVA FUNCIÓN: Guardar datos en MongoDB
-// ========================================
 async function saveDataToMongo(username, data, samplingRate, eventId) {
     try {
         const device = await Device.findOne({ assigned_sensor_username: username });
@@ -383,44 +346,48 @@ async function saveDataToMongo(username, data, samplingRate, eventId) {
             username: username,
             datetime: data.datetime,
             device_id: device ? device._id : null,
-            doorStatus: data.doorStatus,
-            sampling_rate: samplingRate, // ← NUEVO CAMPO
-            door_event_id: eventId // ← NUEVO CAMPO
+            doorStatus: data.doorStatus || 'closed',
+            sampling_rate: samplingRate,
+            door_event_id: eventId
         });
 
         await mongoData.save();
 
-        console.log(`💾 ${username}: Guardado en DB [${samplingRate}] - T.OUT: ${data.dsTemperature}°C | Door: ${data.doorStatus}`);
+        const doorIcon = data.doorStatus ? (data.doorStatus === 'closed' ? '🚪✅' : '🚪⚠️') : '🚪➖';
+        console.log(`💾 ${username}: Guardado en DB [${samplingRate}] - T.OUT: ${data.dsTemperature}°C | Door: ${data.doorStatus || 'N/A'}`);
     } catch (err) {
         console.error(`❌ Error guardando ${username}:`, err.message);
     }
 }
 
-// 🔄 PING cada 30 segundos
+// ✅ MODIFICADO: Health check más inteligente
 setInterval(() => {
     console.log('📋 Verificando conexiones WebSocket...');
+    const now = Date.now();
+
     wss.clients.forEach(ws => {
-        if (!ws.isAlive) {
-            console.warn(`💀 ${ws.username ?? 'Cliente'} sin respuesta. Cerrando WebSocket...`);
+        const timeSinceLastMessage = now - (ws.lastMessageTime || 0);
+
+        // Cerrar si:
+        // 1. No respondió pong Y
+        // 2. No ha enviado ningún mensaje en 60 segundos
+        if (!ws.isAlive && timeSinceLastMessage > 60000) {
+            console.warn(`💀 ${ws.username ?? 'Cliente'} sin actividad >60s. Cerrando WebSocket...`);
             return ws.terminate();
         }
+
         ws.isAlive = false;
         ws.ping(() => {});
         console.log(`📤 Ping enviado desde backend a ${ws.username ?? 'cliente desconocido'}`);
     });
 }, 30000);
 
-// 🧾 Mostrar lista de clientes activos cada 30s
 setInterval(() => {
     const connected = [];
     wss.clients.forEach(ws => connected.push(ws.username ?? 'cliente desconocido'));
-    console.log('🔍 Clientes activos:', connected);
+    console.log(`🔍 Clientes activos: ${connected}`);
 }, 30000);
 
-// ========================================
-// ⚠️ MODIFICADO: Ya no guardamos aquí, se maneja en tiempo real
-// Este intervalo ahora solo limpia sensores inactivos
-// ========================================
 setInterval(() => {
     console.log('🧹 Limpiando sensores inactivos...');
     const now = Date.now();
@@ -434,7 +401,7 @@ setInterval(() => {
             doorState.delete(username);
         }
     }
-}, 10 * 60 * 1000); // Cada 10 minutos
+}, 10 * 60 * 1000);
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {

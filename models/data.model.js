@@ -26,8 +26,8 @@ const dataSchema = new mongoose.Schema({
         ref: 'Device'
     },
     doorStatus: {
-        required: true,
-        type: String
+        type: String,
+        default: 'closed'  // ← Sin required: true para compatibilidad con simuladores
     },
     // ========================================
     // ✨ NUEVOS CAMPOS para lógica de puerta
