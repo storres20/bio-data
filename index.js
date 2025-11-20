@@ -1,3 +1,5 @@
+// index.js
+
 require('dotenv').config();
 
 const express = require('express');
@@ -59,6 +61,46 @@ app.get('/api/door-events/:username', async (req, res) => {
         res.json(events);
     } catch (err) {
         res.status(500).json({ error: 'Error fetching door events' });
+    }
+});
+
+
+// TEMP.OUT, TEMP.OUT MIN
+app.get('/api/v1/datas/temp-extremes/:username', async (req, res) => {
+    try {
+        const { username } = req.params;
+
+        // Fecha de hoy en UTC
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const tomorrow = new Date(today);
+        tomorrow.setDate(tomorrow.getDate() + 1);
+
+        // Buscar en 10mindata
+        const data = await TenMinData.find({
+            username: username,
+            datetime: {
+                $gte: today,
+                $lt: tomorrow
+            }
+        }).sort({ dsTemperature: 1 }); // Ordenar por temperatura
+
+        if (data.length === 0) {
+            return res.json({ min: null, max: null });
+        }
+
+        const minTemp = data[0].dsTemperature; // Primera (mínima)
+        const maxTemp = data[data.length - 1].dsTemperature; // Última (máxima)
+
+        res.json({
+            min: parseFloat(minTemp.toFixed(1)),
+            max: parseFloat(maxTemp.toFixed(1)),
+            count: data.length
+        });
+
+    } catch (err) {
+        console.error('Error fetching temp extremes:', err);
+        res.status(500).json({ error: 'Error fetching temperature extremes' });
     }
 });
 
