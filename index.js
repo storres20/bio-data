@@ -9,6 +9,10 @@ const http = require('http');
 const datas = require('./routes/data.routes');
 const authRoutes = require('./routes/auth.routes');
 const devices = require('./routes/device.routes');
+
+const TenMinData = require('./models/tenmin-data.model');
+const FourHData = require('./models/fourh-data.model');
+
 const Data = require('./models/data.model');
 const Device = require('./models/device.model');
 const Simulation = require('./models/simulation.model');
@@ -83,7 +87,7 @@ wss.on('connection', (ws) => {
     }, 10000);
 
     ws.isAlive = true;
-    ws.lastMessageTime = Date.now(); // ← NUEVO: Inicializar timestamp
+    ws.lastMessageTime = Date.now();
 
     ws.on('message', async (message) => {
         try {
@@ -104,16 +108,13 @@ wss.on('connection', (ws) => {
                 if (!doorState.has(username)) {
                     doorState.set(username, {
                         status: parsed.doorStatus || 'closed',
-                        lastSaveTime: 0,
-                        samplingRate: 10 * 60 * 1000,
-                        currentEvent: null,
-                        tempBeforeOpen: null,
-                        recoveryMode: false
+                        lastSaved10MinSlot: null,
+                        lastSaved4HSlot: null,
+                        currentEvent: null
                     });
                 }
             }
 
-            // ✅ CRÍTICO: Marcar como vivo con CUALQUIER mensaje (no solo pong)
             ws.isAlive = true;
             ws.lastMessageTime = Date.now();
 
@@ -127,7 +128,12 @@ wss.on('connection', (ws) => {
                 });
             }
 
-            await handleDoorStatusChange(username, parsed);
+            // Siempre guardar en colecciones regulares
+            await saveTo10MinData(username, parsed);
+            await saveTo4HData(username, parsed);
+
+            // Manejar eventos de puerta
+            await handleDoorEvents(username, parsed);
 
             wss.clients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) {
@@ -166,30 +172,132 @@ wss.on('connection', (ws) => {
     });
 });
 
-async function handleDoorStatusChange(username, data) {
-    const state = doorState.get(username);
-    if (!state) return;
+/**
+ * Calcula el slot de 10 minutos (00, 10, 20, 30, 40, 50)
+ */
+function get10MinSlot(datetime) {
+    const date = new Date(datetime);
+    const minutes = date.getMinutes();
+    const roundedMinutes = Math.floor(minutes / 10) * 10;
 
-    // Si no tiene doorStatus (simuladores antiguos), solo guardar normalmente
-    if (!data.doorStatus) {
-        await checkAndSaveData(username, data);
-        return;
+    date.setMinutes(roundedMinutes);
+    date.setSeconds(0);
+    date.setMilliseconds(0);
+
+    return date;
+}
+
+/**
+ * Calcula el slot de 4 horas (00:00, 04:00, 08:00, 12:00, 16:00, 20:00)
+ */
+function get4HSlot(datetime) {
+    const date = new Date(datetime);
+    const hours = date.getHours();
+    const roundedHours = Math.floor(hours / 4) * 4;
+
+    date.setHours(roundedHours);
+    date.setMinutes(0);
+    date.setSeconds(0);
+    date.setMilliseconds(0);
+
+    return date;
+}
+
+/**
+ * Guarda datos en colección 10mindata
+ */
+async function saveTo10MinData(username, data) {
+    try {
+        const slot = get10MinSlot(data.datetime);
+        const state = doorState.get(username);
+
+        // Evitar duplicados
+        if (state.lastSaved10MinSlot && state.lastSaved10MinSlot.getTime() === slot.getTime()) {
+            return;
+        }
+
+        const device = await Device.findOne({ assigned_sensor_username: username });
+
+        const tenMinData = new TenMinData({
+            temperature: parseFloat(data.temperature),
+            humidity: parseFloat(data.humidity),
+            dsTemperature: parseFloat(data.dsTemperature),
+            username: username,
+            datetime: new Date(data.datetime),
+            device_id: device ? device._id : null,
+            doorStatus: data.doorStatus || 'closed',
+            time_slot: slot
+        });
+
+        await tenMinData.save();
+        state.lastSaved10MinSlot = slot;
+        doorState.set(username, state);
+
+        console.log(`📊 10MIN: ${username} → Slot ${slot.toISOString()} - T.OUT: ${data.dsTemperature}°C - Door: ${data.doorStatus || 'N/A'}`);
+    } catch (err) {
+        if (err.code === 11000) {
+            console.log(`⚠️ 10MIN: ${username} → Slot duplicado, ignorado`);
+        } else {
+            console.error(`❌ Error guardando en 10mindata:`, err.message);
+        }
     }
+}
+
+/**
+ * Guarda datos en colección 4hdata
+ */
+async function saveTo4HData(username, data) {
+    try {
+        const slot = get4HSlot(data.datetime);
+        const state = doorState.get(username);
+
+        // Evitar duplicados
+        if (state.lastSaved4HSlot && state.lastSaved4HSlot.getTime() === slot.getTime()) {
+            return;
+        }
+
+        const device = await Device.findOne({ assigned_sensor_username: username });
+
+        const fourHData = new FourHData({
+            temperature: parseFloat(data.temperature),
+            humidity: parseFloat(data.humidity),
+            dsTemperature: parseFloat(data.dsTemperature),
+            username: username,
+            datetime: new Date(data.datetime),
+            device_id: device ? device._id : null,
+            doorStatus: data.doorStatus || 'closed',
+            time_slot: slot
+        });
+
+        await fourHData.save();
+        state.lastSaved4HSlot = slot;
+        doorState.set(username, state);
+
+        console.log(`📈 4H: ${username} → Slot ${slot.toISOString()} - T.OUT: ${data.dsTemperature}°C - Door: ${data.doorStatus || 'N/A'}`);
+    } catch (err) {
+        if (err.code === 11000) {
+            console.log(`⚠️ 4H: ${username} → Slot duplicado, ignorado`);
+        } else {
+            console.error(`❌ Error guardando en 4hdata:`, err.message);
+        }
+    }
+}
+
+/**
+ * Maneja eventos de apertura/cierre de puerta
+ */
+async function handleDoorEvents(username, data) {
+    const state = doorState.get(username);
+    if (!state || !data.doorStatus) return;
 
     const currentStatus = data.doorStatus;
     const previousStatus = state.status;
 
-    if (currentStatus === previousStatus) {
-        await checkAndSaveData(username, data);
-        return;
-    }
-
-    console.log(`🚪 ${username}: Cambio de estado ${previousStatus} → ${currentStatus}`);
-
+    // ============================================
+    // PUERTA SE ABRE (closed → open)
+    // ============================================
     if (currentStatus === 'open' && previousStatus === 'closed') {
-        console.log(`🔓 ${username}: PUERTA ABIERTA - Iniciando monitoreo intensivo`);
-
-        await saveDataToMongo(username, data, '1min', null);
+        console.log(`🔓 ${username}: PUERTA ABIERTA`);
 
         try {
             const device = await Device.findOne({ assigned_sensor_username: username });
@@ -205,12 +313,7 @@ async function handleDoorStatusChange(username, data) {
             });
 
             await newEvent.save();
-
             state.currentEvent = newEvent._id;
-            state.tempBeforeOpen = parseFloat(data.dsTemperature);
-            state.samplingRate = 1 * 60 * 1000;
-            state.lastSaveTime = Date.now();
-            state.recoveryMode = false;
 
             console.log(`✅ Evento de puerta creado: ${newEvent._id}`);
         } catch (err) {
@@ -218,149 +321,44 @@ async function handleDoorStatusChange(username, data) {
         }
     }
 
+        // ============================================
+        // PUERTA SE CIERRA (open → closed)
+    // ============================================
     else if (currentStatus === 'closed' && previousStatus === 'open') {
-        console.log(`🔒 ${username}: PUERTA CERRADA - Iniciando modo recuperación`);
-
-        await saveDataToMongo(username, data, '1min', state.currentEvent);
+        console.log(`🔒 ${username}: PUERTA CERRADA`);
 
         if (state.currentEvent) {
             try {
-                const openedEvent = await DoorEvent.findById(state.currentEvent);
-                if (openedEvent) {
-                    const duration = (new Date(data.datetime) - openedEvent.opened_at) / 1000;
+                const event = await DoorEvent.findById(state.currentEvent);
+                if (event) {
+                    const duration = (new Date(data.datetime) - event.opened_at) / 1000;
 
-                    openedEvent.closed_at = new Date(data.datetime);
-                    openedEvent.temp_OUT_after = parseFloat(data.dsTemperature);
-                    openedEvent.temp_IN_after = parseFloat(data.temperature);
-                    openedEvent.humidity_after = parseFloat(data.humidity);
-                    openedEvent.duration_seconds = duration;
-                    openedEvent.temp_OUT_drop = parseFloat(data.dsTemperature) - state.tempBeforeOpen;
-                    openedEvent.temp_IN_drop = parseFloat(data.temperature) - openedEvent.temp_IN_before;
-                    openedEvent.status = 'recovering';
+                    event.closed_at = new Date(data.datetime);
+                    event.temp_OUT_after = parseFloat(data.dsTemperature);
+                    event.temp_IN_after = parseFloat(data.temperature);
+                    event.humidity_after = parseFloat(data.humidity);
+                    event.duration_seconds = duration;
+                    event.temp_OUT_drop = parseFloat(data.dsTemperature) - event.temp_OUT_before;
+                    event.temp_IN_drop = parseFloat(data.temperature) - event.temp_IN_before;
+                    event.status = 'completed';
 
-                    await openedEvent.save();
+                    await event.save();
 
-                    console.log(`✅ Evento actualizado (cerrado): duración ${duration.toFixed(0)}s, Δ temp ${openedEvent.temp_OUT_drop.toFixed(1)}°C`);
+                    console.log(`✅ Evento completado: ${event._id} - Duración: ${duration.toFixed(0)}s - Δ T.OUT: ${event.temp_OUT_drop.toFixed(1)}°C`);
                 }
             } catch (err) {
-                console.error(`❌ Error actualizando evento al cerrar: ${err.message}`);
+                console.error(`❌ Error cerrando evento: ${err.message}`);
             }
-        }
 
-        state.recoveryMode = true;
-        state.lastSaveTime = Date.now();
+            state.currentEvent = null;
+        }
     }
 
     state.status = currentStatus;
     doorState.set(username, state);
 }
 
-async function checkAndSaveData(username, data) {
-    const state = doorState.get(username);
-    if (!state) return;
-
-    const now = Date.now();
-    const timeSinceLastSave = now - state.lastSaveTime;
-
-    if (timeSinceLastSave >= state.samplingRate) {
-        const samplingLabel = state.samplingRate === 600000 ? '10min' : '1min';
-        await saveDataToMongo(username, data, samplingLabel, state.currentEvent);
-        state.lastSaveTime = now;
-
-        if (state.recoveryMode && state.currentEvent && state.tempBeforeOpen !== null) {
-            const tempDiff = Math.abs(parseFloat(data.dsTemperature) - state.tempBeforeOpen);
-            const tolerance = parseFloat(data.dsTemperature) < 15 ? 1.0 : 0.5;
-
-            if (tempDiff <= tolerance) {
-                console.log(`✅ ${username}: TEMPERATURA ESTABILIZADA (Δ = ${tempDiff.toFixed(2)}°C) - Volviendo a modo normal`);
-
-                await saveDataToMongo(username, data, '1min', state.currentEvent);
-
-                try {
-                    const event = await DoorEvent.findById(state.currentEvent);
-                    if (event) {
-                        const recoveryTime = (new Date(data.datetime) - event.closed_at) / 1000;
-
-                        event.stabilized_at = new Date(data.datetime);
-                        event.temp_OUT_stabilized = parseFloat(data.dsTemperature);
-                        event.recovery_time_seconds = recoveryTime;
-                        event.recovery_efficiency = state.tempBeforeOpen !== 0 ? parseFloat(data.dsTemperature) / state.tempBeforeOpen : 1;
-                        event.status = 'completed';
-
-                        await event.save();
-
-                        console.log(`✅ Evento completado: recuperación en ${recoveryTime.toFixed(0)}s`);
-                    }
-                } catch (err) {
-                    console.error(`❌ Error completando evento: ${err.message}`);
-                }
-
-                state.samplingRate = 10 * 60 * 1000;
-                state.recoveryMode = false;
-                state.currentEvent = null;
-                state.tempBeforeOpen = null;
-            }
-        }
-
-        if (state.recoveryMode && state.currentEvent) {
-            try {
-                const event = await DoorEvent.findById(state.currentEvent);
-                if (event && event.closed_at) {
-                    const timeSinceClosed = (Date.now() - new Date(event.closed_at).getTime()) / 1000;
-
-                    if (timeSinceClosed > 30 * 60) {
-                        console.warn(`⚠️ ${username}: Recuperación térmica >30min - Forzando modo normal`);
-
-                        event.stabilized_at = new Date(data.datetime);
-                        event.temp_OUT_stabilized = parseFloat(data.dsTemperature);
-                        event.recovery_time_seconds = timeSinceClosed;
-                        event.recovery_efficiency = state.tempBeforeOpen !== 0 ? parseFloat(data.dsTemperature) / state.tempBeforeOpen : 1;
-                        event.status = 'timeout';
-                        event.notes = 'Recuperación térmica excedió 30 minutos';
-
-                        await event.save();
-
-                        state.samplingRate = 10 * 60 * 1000;
-                        state.recoveryMode = false;
-                        state.currentEvent = null;
-                        state.tempBeforeOpen = null;
-                    }
-                }
-            } catch (err) {
-                console.error(`❌ Error verificando timeout: ${err.message}`);
-            }
-        }
-
-        doorState.set(username, state);
-    }
-}
-
-async function saveDataToMongo(username, data, samplingRate, eventId) {
-    try {
-        const device = await Device.findOne({ assigned_sensor_username: username });
-
-        const mongoData = new Data({
-            temperature: data.temperature,
-            humidity: data.humidity,
-            dsTemperature: data.dsTemperature,
-            username: username,
-            datetime: data.datetime,
-            device_id: device ? device._id : null,
-            doorStatus: data.doorStatus || 'closed',
-            sampling_rate: samplingRate,
-            door_event_id: eventId
-        });
-
-        await mongoData.save();
-
-        const doorIcon = data.doorStatus ? (data.doorStatus === 'closed' ? '🚪✅' : '🚪⚠️') : '🚪➖';
-        console.log(`💾 ${username}: Guardado en DB [${samplingRate}] - T.OUT: ${data.dsTemperature}°C | Door: ${data.doorStatus || 'N/A'}`);
-    } catch (err) {
-        console.error(`❌ Error guardando ${username}:`, err.message);
-    }
-}
-
-// ✅ MODIFICADO: Health check más inteligente
+// Health check para WebSockets
 setInterval(() => {
     console.log('📋 Verificando conexiones WebSocket...');
     const now = Date.now();
@@ -368,9 +366,6 @@ setInterval(() => {
     wss.clients.forEach(ws => {
         const timeSinceLastMessage = now - (ws.lastMessageTime || 0);
 
-        // Cerrar si:
-        // 1. No respondió pong Y
-        // 2. No ha enviado ningún mensaje en 60 segundos
         if (!ws.isAlive && timeSinceLastMessage > 60000) {
             console.warn(`💀 ${ws.username ?? 'Cliente'} sin actividad >60s. Cerrando WebSocket...`);
             return ws.terminate();
