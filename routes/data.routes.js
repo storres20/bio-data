@@ -1,5 +1,5 @@
 const express = require('express');
-const Model = require('../models/data.model');
+const Model = require('../models/fourh-data.model');
 
 const router = express.Router();
 

@@ -13,7 +13,7 @@ const devices = require('./routes/device.routes');
 const TenMinData = require('./models/tenmin-data.model');
 const FourHData = require('./models/fourh-data.model');
 
-const Data = require('./models/data.model');
+//const Data = require('./models/data.model');
 const Device = require('./models/device.model');
 const Simulation = require('./models/simulation.model');
 const DoorEvent = require('./models/door-event.model');
