@@ -54,20 +54,6 @@ const doorEventSchema = new mongoose.Schema({
         default: null
     },
 
-    // Datos de recuperación
-    stabilized_at: {
-        type: Date,
-        default: null
-    },
-    temp_OUT_stabilized: {
-        type: Number,
-        default: null
-    },
-    recovery_time_seconds: {
-        type: Number,
-        default: null
-    },
-
     // Análisis calculado
     temp_OUT_drop: {
         type: Number,
@@ -77,15 +63,11 @@ const doorEventSchema = new mongoose.Schema({
         type: Number,
         default: null
     },
-    recovery_efficiency: {
-        type: Number,
-        default: null
-    },
 
     // Estado del evento
     status: {
         type: String,
-        enum: ['in_progress', 'recovering', 'completed', 'timeout'],
+        enum: ['in_progress', 'completed'],
         default: 'in_progress',
         index: true
     },
