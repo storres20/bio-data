@@ -293,7 +293,7 @@ async function saveTo10MinData(username, data) {
         console.log(`📊 10MIN: ${username} → Slot ${slot.toISOString()} - T.OUT: ${data.dsTemperature}°C - Door: ${data.doorStatus || 'N/A'}`);
     } catch (err) {
         if (err.code === 11000) {
-            console.log(`⚠️ 10MIN: ${username} → Slot duplicado, ignorado`);
+            //console.log(`⚠️ 10MIN: ${username} → Slot duplicado, ignorado`);
         } else {
             console.error(`❌ Error guardando en 10mindata:`, err.message);
         }
@@ -333,7 +333,7 @@ async function saveTo4HData(username, data) {
         console.log(`📈 4H: ${username} → Slot ${slot.toISOString()} - T.OUT: ${data.dsTemperature}°C - Door: ${data.doorStatus || 'N/A'}`);
     } catch (err) {
         if (err.code === 11000) {
-            console.log(`⚠️ 4H: ${username} → Slot duplicado, ignorado`);
+            //console.log(`⚠️ 4H: ${username} → Slot duplicado, ignorado`);
         } else {
             console.error(`❌ Error guardando en 4hdata:`, err.message);
         }
