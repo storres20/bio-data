@@ -201,9 +201,24 @@ wss.on('connection', (ws) => {
     ws.on('close', () => {
         if (username && userConnections.has(username)) {
             userConnections.get(username).delete(ws);
+
+            // Si no quedan más conexiones activas para este usuario
             if (userConnections.get(username).size === 0) {
                 userConnections.delete(username);
+
+                // ✅ AGREGAR: Limpiar inmediatamente de latestDataPerSensor
+                if (latestDataPerSensor.has(username)) {
+                    latestDataPerSensor.delete(username);
+                    console.log(`🧹 Caché de datos eliminado para ${username}`);
+                }
+
+                // ✅ AGREGAR: Limpiar doorState
+                if (doorState.has(username)) {
+                    doorState.delete(username);
+                    console.log(`🚪 Estado de puerta eliminado para ${username}`);
+                }
             }
+
             console.log(`➖ WebSocket eliminado para ${username}`);
         }
         console.log(`🔌 WebSocket cerrado para ${username ?? 'cliente desconocido'}`);
