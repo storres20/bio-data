@@ -8,6 +8,9 @@ const mongoose = require('mongoose');
 const WebSocket = require('ws');
 const http = require('http');
 
+// ⬇️ NUEVO: Importar Firebase Admin
+const admin = require('firebase-admin');
+
 const datas = require('./routes/data.routes');
 const authRoutes = require('./routes/auth.routes');
 const devices = require('./routes/device.routes');
@@ -15,10 +18,24 @@ const devices = require('./routes/device.routes');
 const TenMinData = require('./models/tenmin-data.model');
 const FourHData = require('./models/fourh-data.model');
 
-//const Data = require('./models/data.model');
 const Device = require('./models/device.model');
 const Simulation = require('./models/simulation.model');
 const DoorEvent = require('./models/door-event.model');
+
+// ⬇️ NUEVO: Inicializar Firebase Admin
+try {
+    const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT
+        ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+        : require('./firebase-service-account.json');
+
+    admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+    });
+
+    console.log('✅ Firebase Admin inicializado');
+} catch (error) {
+    console.error('❌ Error inicializando Firebase:', error.message);
+}
 
 const mongoString = process.env.DATABASE_URL;
 mongoose.set("strictQuery", false);
@@ -36,6 +53,25 @@ app.get("/", (req, res) => res.json({ message: "Welcome to Bio-Data Back-End app
 app.use('/api/v1/datas', datas);
 app.use('/api/auth', authRoutes);
 app.use('/api/devices', devices);
+
+// ⬇️ NUEVO: Endpoint para registrar FCM token
+app.post('/api/devices/fcm-token', async (req, res) => {
+    try {
+        const { observerId, fcmToken } = req.body;
+
+        if (!observerId || !fcmToken) {
+            return res.status(400).json({ error: 'observerId and fcmToken required' });
+        }
+
+        fcmTokens.set(observerId, fcmToken);
+        console.log(`🔑 FCM Token registrado para ${observerId}`);
+
+        res.json({ success: true, message: 'Token registered successfully' });
+    } catch (error) {
+        console.error('❌ Error registrando FCM token:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
 
 app.get('/api/simulations', async (req, res) => {
     try {
@@ -64,33 +100,29 @@ app.get('/api/door-events/:username', async (req, res) => {
     }
 });
 
-
-// TEMP.OUT, TEMP.OUT MIN
 app.get('/api/v1/datas/temp-extremes/:username', async (req, res) => {
     try {
         const { username } = req.params;
 
-        // Fecha de hoy en UTC
         const today = new Date();
         today.setHours(0, 0, 0, 0);
         const tomorrow = new Date(today);
         tomorrow.setDate(tomorrow.getDate() + 1);
 
-        // Buscar en 10mindata
         const data = await TenMinData.find({
             username: username,
             datetime: {
                 $gte: today,
                 $lt: tomorrow
             }
-        }).sort({ dsTemperature: 1 }); // Ordenar por temperatura
+        }).sort({ dsTemperature: 1 });
 
         if (data.length === 0) {
             return res.json({ min: null, max: null });
         }
 
-        const minTemp = data[0].dsTemperature; // Primera (mínima)
-        const maxTemp = data[data.length - 1].dsTemperature; // Última (máxima)
+        const minTemp = data[0].dsTemperature;
+        const maxTemp = data[data.length - 1].dsTemperature;
 
         res.json({
             min: parseFloat(minTemp.toFixed(1)),
@@ -104,11 +136,59 @@ app.get('/api/v1/datas/temp-extremes/:username', async (req, res) => {
     }
 });
 
+// ⬇️ NUEVO: Función para enviar notificación push
+async function sendPushNotification(observerId, title, body, data = {}) {
+    try {
+        const fcmToken = fcmTokens.get(observerId);
+
+        if (!fcmToken) {
+            console.log(`⚠️ No hay FCM token para ${observerId}`);
+            return;
+        }
+
+        const message = {
+            notification: {
+                title: title,
+                body: body,
+            },
+            data: {
+                ...data,
+                timestamp: Date.now().toString(),
+            },
+            token: fcmToken,
+            android: {
+                priority: 'high',
+                notification: {
+                    channelId: 'door_alerts',
+                    sound: 'default',
+                    priority: 'high',
+                    defaultVibrateTimings: true,
+                    color: '#EF4444',
+                },
+            },
+        };
+
+        const response = await admin.messaging().send(message);
+        console.log(`✅ Notificación enviada a ${observerId}:`, response);
+        return response;
+    } catch (error) {
+        console.error(`❌ Error enviando notificación a ${observerId}:`, error.message);
+
+        // Si el token es inválido, eliminarlo
+        if (error.code === 'messaging/invalid-registration-token' ||
+            error.code === 'messaging/registration-token-not-registered') {
+            fcmTokens.delete(observerId);
+            console.log(`🗑️ Token inválido eliminado para ${observerId}`);
+        }
+    }
+}
+
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 const latestDataPerSensor = new Map();
 const userConnections = new Map();
 const doorState = new Map();
+const fcmTokens = new Map(); // ⬅️ NUEVO: Almacenar FCM tokens
 
 server.on('upgrade', (req, socket, head) => {
     console.log("📡 Upgrade request for WebSocket");
@@ -126,7 +206,7 @@ wss.on('connection', (ws) => {
             console.warn('⏱️ Cliente no identificado. Cerrando WebSocket por seguridad.');
             ws.close();
         }
-    }, 10000);
+    }, 30000); // ⬅️ MODIFICADO: Aumentado de 10s a 30s
 
     ws.isAlive = true;
     ws.lastMessageTime = Date.now();
@@ -134,6 +214,15 @@ wss.on('connection', (ws) => {
     ws.on('message', async (message) => {
         try {
             const parsed = JSON.parse(message);
+
+            // ⬇️ NUEVO: Responder a PING sin username (observadores)
+            if (parsed.type === 'ping' && !parsed.username) {
+                ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+                ws.isAlive = true;
+                ws.lastMessageTime = Date.now();
+                return;
+            }
+
             if (!parsed.username) return;
 
             if (!username) {
@@ -152,7 +241,9 @@ wss.on('connection', (ws) => {
                         status: parsed.doorStatus || 'closed',
                         lastSaved10MinSlot: null,
                         lastSaved4HSlot: null,
-                        currentEvent: null
+                        currentEvent: null,
+                        doorOpenedAt: null, // ⬅️ NUEVO
+                        alertSent: false,   // ⬅️ NUEVO
                     });
                 }
             }
@@ -170,7 +261,7 @@ wss.on('connection', (ws) => {
                 });
             }
 
-            // Siempre guardar en colecciones regulares
+            // Guardar en colecciones regulares
             await saveTo10MinData(username, parsed);
             await saveTo4HData(username, parsed);
 
@@ -191,28 +282,20 @@ wss.on('connection', (ws) => {
     ws.on('pong', () => {
         ws.isAlive = true;
         ws.lastMessageTime = Date.now();
-        console.log(`📡 Pong recibido de ${ws.username ?? 'cliente desconocido'}`);
-    });
-
-    ws.on('ping', () => {
-        console.log(`📶 Ping recibido de ${ws.username ?? 'cliente desconocido'}`);
     });
 
     ws.on('close', () => {
         if (username && userConnections.has(username)) {
             userConnections.get(username).delete(ws);
 
-            // Si no quedan más conexiones activas para este usuario
             if (userConnections.get(username).size === 0) {
                 userConnections.delete(username);
 
-                // ✅ AGREGAR: Limpiar inmediatamente de latestDataPerSensor
                 if (latestDataPerSensor.has(username)) {
                     latestDataPerSensor.delete(username);
                     console.log(`🧹 Caché de datos eliminado para ${username}`);
                 }
 
-                // ✅ AGREGAR: Limpiar doorState
                 if (doorState.has(username)) {
                     doorState.delete(username);
                     console.log(`🚪 Estado de puerta eliminado para ${username}`);
@@ -229,9 +312,6 @@ wss.on('connection', (ws) => {
     });
 });
 
-/**
- * Calcula el slot de 10 minutos (00, 10, 20, 30, 40, 50)
- */
 function get10MinSlot(datetime) {
     const date = new Date(datetime);
     const minutes = date.getMinutes();
@@ -244,9 +324,6 @@ function get10MinSlot(datetime) {
     return date;
 }
 
-/**
- * Calcula el slot de 4 horas (00:00, 04:00, 08:00, 12:00, 16:00, 20:00)
- */
 function get4HSlot(datetime) {
     const date = new Date(datetime);
     const hours = date.getHours();
@@ -260,16 +337,12 @@ function get4HSlot(datetime) {
     return date;
 }
 
-/**
- * Guarda datos en colección 10mindata
- */
 async function saveTo10MinData(username, data) {
     try {
         const slot = get10MinSlot(data.datetime);
         const state = doorState.get(username);
 
-        // Evitar duplicados
-        if (state.lastSaved10MinSlot && state.lastSaved10MinSlot.getTime() === slot.getTime()) {
+        if (state && state.lastSaved10MinSlot && state.lastSaved10MinSlot.getTime() === slot.getTime()) {
             return;
         }
 
@@ -287,29 +360,26 @@ async function saveTo10MinData(username, data) {
         });
 
         await tenMinData.save();
-        state.lastSaved10MinSlot = slot;
-        doorState.set(username, state);
+
+        if (state) {
+            state.lastSaved10MinSlot = slot;
+            doorState.set(username, state);
+        }
 
         console.log(`📊 10MIN: ${username} → Slot ${slot.toISOString()} - T.OUT: ${data.dsTemperature}°C - Door: ${data.doorStatus || 'N/A'}`);
     } catch (err) {
-        if (err.code === 11000) {
-            //console.log(`⚠️ 10MIN: ${username} → Slot duplicado, ignorado`);
-        } else {
+        if (err.code !== 11000) {
             console.error(`❌ Error guardando en 10mindata:`, err.message);
         }
     }
 }
 
-/**
- * Guarda datos en colección 4hdata
- */
 async function saveTo4HData(username, data) {
     try {
         const slot = get4HSlot(data.datetime);
         const state = doorState.get(username);
 
-        // Evitar duplicados
-        if (state.lastSaved4HSlot && state.lastSaved4HSlot.getTime() === slot.getTime()) {
+        if (state && state.lastSaved4HSlot && state.lastSaved4HSlot.getTime() === slot.getTime()) {
             return;
         }
 
@@ -327,22 +397,21 @@ async function saveTo4HData(username, data) {
         });
 
         await fourHData.save();
-        state.lastSaved4HSlot = slot;
-        doorState.set(username, state);
+
+        if (state) {
+            state.lastSaved4HSlot = slot;
+            doorState.set(username, state);
+        }
 
         console.log(`📈 4H: ${username} → Slot ${slot.toISOString()} - T.OUT: ${data.dsTemperature}°C - Door: ${data.doorStatus || 'N/A'}`);
     } catch (err) {
-        if (err.code === 11000) {
-            //console.log(`⚠️ 4H: ${username} → Slot duplicado, ignorado`);
-        } else {
+        if (err.code !== 11000) {
             console.error(`❌ Error guardando en 4hdata:`, err.message);
         }
     }
 }
 
-/**
- * Maneja eventos de apertura/cierre de puerta
- */
+// ⬇️ MODIFICADO: handleDoorEvents con alertas push
 async function handleDoorEvents(username, data) {
     const state = doorState.get(username);
     if (!state || !data.doorStatus) return;
@@ -350,9 +419,7 @@ async function handleDoorEvents(username, data) {
     const currentStatus = data.doorStatus;
     const previousStatus = state.status;
 
-    // ============================================
     // PUERTA SE ABRE (closed → open)
-    // ============================================
     if (currentStatus === 'open' && previousStatus === 'closed') {
         console.log(`🔓 ${username}: PUERTA ABIERTA`);
 
@@ -371,6 +438,8 @@ async function handleDoorEvents(username, data) {
 
             await newEvent.save();
             state.currentEvent = newEvent._id;
+            state.doorOpenedAt = Date.now(); // ⬅️ NUEVO
+            state.alertSent = false; // ⬅️ NUEVO
 
             console.log(`✅ Evento de puerta creado: ${newEvent._id}`);
         } catch (err) {
@@ -378,9 +447,39 @@ async function handleDoorEvents(username, data) {
         }
     }
 
-        // ============================================
-        // PUERTA SE CIERRA (open → closed)
-    // ============================================
+    // ⬇️ NUEVO: Puerta sigue abierta - verificar alerta
+    else if (currentStatus === 'open' && previousStatus === 'open') {
+        if (state.doorOpenedAt && !state.alertSent) {
+            const timeOpen = Date.now() - state.doorOpenedAt;
+
+            // Si la puerta está abierta por más de 1 minuto
+            if (timeOpen > 60000) {
+                console.log(`🚨 ${username}: PUERTA ABIERTA >1 MIN - Enviando alertas`);
+
+                // Enviar notificación a TODOS los observadores registrados
+                const notificationPromises = [];
+                for (const [observerId, token] of fcmTokens.entries()) {
+                    const promise = sendPushNotification(
+                        observerId,
+                        '🚨 DOOR ALERT',
+                        `${username}: Door has been open for more than 1 minute!`,
+                        {
+                            type: 'door_alert',
+                            username: username,
+                            temperature: data.dsTemperature.toString(),
+                            timeOpen: Math.floor(timeOpen / 1000).toString(),
+                        }
+                    );
+                    notificationPromises.push(promise);
+                }
+
+                await Promise.all(notificationPromises);
+                state.alertSent = true;
+            }
+        }
+    }
+
+    // PUERTA SE CIERRA (open → closed)
     else if (currentStatus === 'closed' && previousStatus === 'open') {
         console.log(`🔒 ${username}: PUERTA CERRADA`);
 
@@ -409,6 +508,10 @@ async function handleDoorEvents(username, data) {
 
             state.currentEvent = null;
         }
+
+        // ⬅️ NUEVO: Reset alert state
+        state.doorOpenedAt = null;
+        state.alertSent = false;
     }
 
     state.status = currentStatus;
@@ -417,27 +520,19 @@ async function handleDoorEvents(username, data) {
 
 // Health check para WebSockets
 setInterval(() => {
-    console.log('📋 Verificando conexiones WebSocket...');
     const now = Date.now();
 
     wss.clients.forEach(ws => {
         const timeSinceLastMessage = now - (ws.lastMessageTime || 0);
 
-        if (!ws.isAlive && timeSinceLastMessage > 60000) {
-            console.warn(`💀 ${ws.username ?? 'Cliente'} sin actividad >60s. Cerrando WebSocket...`);
+        if (!ws.isAlive && timeSinceLastMessage > 180000) { // ⬅️ MODIFICADO: 3 minutos
+            console.warn(`💀 ${ws.username ?? 'Cliente'} sin actividad >3min. Cerrando WebSocket...`);
             return ws.terminate();
         }
 
         ws.isAlive = false;
         ws.ping(() => {});
-        console.log(`📤 Ping enviado desde backend a ${ws.username ?? 'cliente desconocido'}`);
     });
-}, 30000);
-
-setInterval(() => {
-    const connected = [];
-    wss.clients.forEach(ws => connected.push(ws.username ?? 'cliente desconocido'));
-    console.log(`🔍 Clientes activos: ${connected}`);
 }, 30000);
 
 setInterval(() => {
