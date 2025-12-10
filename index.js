@@ -53,7 +53,6 @@ app.use('/api/v1/datas', datas);
 app.use('/api/auth', authRoutes);
 app.use('/api/devices', devices);
 
-// ⬇️ MEJORADO: Endpoint para registrar FCM token con prevención de duplicados
 app.post('/api/devices/fcm-token', async (req, res) => {
     try {
         const { observerId, fcmToken } = req.body;
@@ -62,7 +61,6 @@ app.post('/api/devices/fcm-token', async (req, res) => {
             return res.status(400).json({ error: 'observerId and fcmToken required' });
         }
 
-        // Verificar si el token ya existe con otro observerId
         let existingObserverId = null;
         for (const [id, data] of fcmTokens.entries()) {
             const existingToken = typeof data === 'string' ? data : data.token;
@@ -72,13 +70,11 @@ app.post('/api/devices/fcm-token', async (req, res) => {
             }
         }
 
-        // Si el token ya existe con otro observerId, eliminar el viejo
         if (existingObserverId) {
             fcmTokens.delete(existingObserverId);
             console.log(`🗑️ Token duplicado eliminado: ${existingObserverId}`);
         }
 
-        // Almacenar con timestamp
         fcmTokens.set(observerId, {
             token: fcmToken,
             registeredAt: Date.now(),
@@ -94,7 +90,6 @@ app.post('/api/devices/fcm-token', async (req, res) => {
     }
 });
 
-// ⬇️ NUEVO: Endpoint de debugging
 app.get('/api/debug/fcm-analysis', (req, res) => {
     const analysis = {
         totalEntries: fcmTokens.size,
@@ -129,6 +124,26 @@ app.get('/api/debug/fcm-analysis', (req, res) => {
         hasDuplicates: analysis.duplicates.length > 0,
         entries: analysis.entries,
         duplicates: analysis.duplicates.length > 0 ? analysis.duplicates : undefined,
+    });
+});
+
+// ⬇️ NUEVO: Endpoint para ver alertas activas
+app.get('/api/debug/active-alerts', (req, res) => {
+    const activeAlerts = [];
+
+    for (const [username, intervalId] of alertIntervals.entries()) {
+        const state = doorState.get(username);
+        activeAlerts.push({
+            username,
+            status: state?.status,
+            doorOpenedAt: state?.doorOpenedAt ? new Date(state.doorOpenedAt).toISOString() : null,
+            alertActive: true,
+        });
+    }
+
+    res.json({
+        totalActiveAlerts: activeAlerts.length,
+        alerts: activeAlerts,
     });
 });
 
@@ -195,7 +210,6 @@ app.get('/api/v1/datas/temp-extremes/:username', async (req, res) => {
     }
 });
 
-// Función para enviar notificación push
 async function sendPushNotification(observerId, title, body, data = {}) {
     try {
         const tokenData = fcmTokens.get(observerId);
@@ -243,12 +257,40 @@ async function sendPushNotification(observerId, title, body, data = {}) {
     }
 }
 
+// ⬇️ NUEVA FUNCIÓN: Enviar alerta a todos los observadores
+async function sendAlertToAllObservers(username, data, timeOpen) {
+    const notificationPromises = [];
+    const totalObservers = fcmTokens.size;
+
+    console.log(`📤 Enviando alerta a ${totalObservers} dispositivos...`);
+
+    for (const [observerId, tokenData] of fcmTokens.entries()) {
+        const promise = sendPushNotification(
+            observerId,
+            '🚨 DOOR ALERT',
+            `${username}: Door has been open for ${Math.floor(timeOpen/1000)} seconds!`,
+            {
+                type: 'door_alert',
+                username: username,
+                temperature: data.dsTemperature.toString(),
+                timeOpen: Math.floor(timeOpen / 1000).toString(),
+                timestamp: Date.now().toString(),
+            }
+        );
+        notificationPromises.push(promise);
+    }
+
+    await Promise.all(notificationPromises);
+    console.log(`✅ Alerta enviada a ${totalObservers} dispositivos`);
+}
+
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 const latestDataPerSensor = new Map();
 const userConnections = new Map();
 const doorState = new Map();
 const fcmTokens = new Map();
+const alertIntervals = new Map(); // ⬅️ NUEVO: Almacenar intervalos de alertas
 
 server.on('upgrade', (req, socket, head) => {
     console.log("📡 Upgrade request for WebSocket");
@@ -275,7 +317,6 @@ wss.on('connection', (ws) => {
         try {
             const parsed = JSON.parse(message);
 
-            // Responder a PING sin username (observadores móviles)
             if (parsed.type === 'ping' && !parsed.username) {
                 ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
                 ws.isAlive = true;
@@ -285,8 +326,6 @@ wss.on('connection', (ws) => {
 
             if (!parsed.username) return;
 
-            // ⬇️ CLAVE: Crear doorState SIEMPRE para cualquier username (sensor o observador)
-            // Los observadores móviles NO tienen datos de sensor, pero eso no importa
             if (!username) {
                 username = parsed.username;
                 ws.username = username;
@@ -298,7 +337,6 @@ wss.on('connection', (ws) => {
                 userConnections.get(username).add(ws);
                 console.log(`➕ WebSocket añadido para ${username}`);
 
-                // ⬇️ RESTAURADO: Crear doorState para TODOS (como código original)
                 if (!doorState.has(username)) {
                     doorState.set(username, {
                         status: parsed.doorStatus || 'closed',
@@ -311,7 +349,6 @@ wss.on('connection', (ws) => {
                     console.log(`🚪 doorState creado para ${username}`);
                 }
 
-                // ⬇️ NUEVO: Si es observador móvil, salir aquí (no procesar como sensor)
                 if (username.startsWith('MOBILE_OBSERVER_')) {
                     console.log(`👁️ Observador móvil registrado: ${username}`);
                     return;
@@ -321,12 +358,10 @@ wss.on('connection', (ws) => {
             ws.isAlive = true;
             ws.lastMessageTime = Date.now();
 
-            // ⬇️ NUEVO: Si es observador móvil, no procesar datos de sensor
             if (username.startsWith('MOBILE_OBSERVER_')) {
                 return;
             }
 
-            // ⬇️ VALIDACIÓN: Solo procesar si tiene datos de sensor completos
             if (!parsed.temperature || !parsed.humidity || !parsed.dsTemperature || !parsed.datetime) {
                 console.log(`⚠️ ${username}: Mensaje incompleto, esperando datos...`);
                 return;
@@ -342,14 +377,10 @@ wss.on('connection', (ws) => {
                 });
             }
 
-            // Guardar en colecciones regulares
             await saveTo10MinData(username, parsed);
             await saveTo4HData(username, parsed);
-
-            // ⬇️ CRÍTICO: Manejar eventos de puerta (aquí se envían las alertas)
             await handleDoorEvents(username, parsed);
 
-            // Broadcast a todos los clientes
             wss.clients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) {
                     client.send(JSON.stringify(parsed));
@@ -373,6 +404,13 @@ wss.on('connection', (ws) => {
             if (userConnections.get(username).size === 0) {
                 userConnections.delete(username);
 
+                // ⬇️ NUEVO: Limpiar alertas cuando sensor se desconecta
+                if (alertIntervals.has(username)) {
+                    clearInterval(alertIntervals.get(username));
+                    alertIntervals.delete(username);
+                    console.log(`🛑 ${username}: Alertas detenidas (sensor desconectado)`);
+                }
+
                 if (latestDataPerSensor.has(username)) {
                     latestDataPerSensor.delete(username);
                     console.log(`🧹 Caché de datos eliminado para ${username}`);
@@ -383,7 +421,6 @@ wss.on('connection', (ws) => {
                     console.log(`🚪 Estado de puerta eliminado para ${username}`);
                 }
 
-                // Limpiar FCM token si es observador
                 if (username.startsWith('MOBILE_OBSERVER_')) {
                     if (fcmTokens.has(username)) {
                         fcmTokens.delete(username);
@@ -501,7 +538,7 @@ async function saveTo4HData(username, data) {
     }
 }
 
-// ⬇️ RESTAURADO: Función original que SÍ funcionaba
+// ⬇️ MODIFICADO: Sistema de alertas repetidas
 async function handleDoorEvents(username, data) {
     const state = doorState.get(username);
     if (!state || !data.doorStatus) return;
@@ -543,25 +580,33 @@ async function handleDoorEvents(username, data) {
             const timeOpen = Date.now() - state.doorOpenedAt;
 
             if (timeOpen > 60000) {
-                console.log(`🚨 ${username}: PUERTA ABIERTA >1 MIN - Enviando alertas a ${fcmTokens.size} dispositivos`);
+                console.log(`🚨 ${username}: PUERTA ABIERTA >1 MIN - Iniciando alertas repetidas`);
 
-                const notificationPromises = [];
-                for (const [observerId, tokenData] of fcmTokens.entries()) {
-                    const promise = sendPushNotification(
-                        observerId,
-                        '🚨 DOOR ALERT',
-                        `${username}: Door has been open for more than 1 minute!`,
-                        {
-                            type: 'door_alert',
-                            username: username,
-                            temperature: data.dsTemperature.toString(),
-                            timeOpen: Math.floor(timeOpen / 1000).toString(),
+                // ⬇️ Enviar primera alerta
+                await sendAlertToAllObservers(username, data, timeOpen);
+
+                // ⬇️ NUEVO: Iniciar loop de alertas cada 20 segundos
+                if (!alertIntervals.has(username)) {
+                    const intervalId = setInterval(async () => {
+                        const currentState = doorState.get(username);
+
+                        // Verificar si la puerta sigue abierta
+                        if (currentState && currentState.status === 'open') {
+                            const currentTimeOpen = Date.now() - currentState.doorOpenedAt;
+                            console.log(`🔔 ${username}: Enviando alerta repetida (${Math.floor(currentTimeOpen/1000)}s abierta)`);
+                            await sendAlertToAllObservers(username, data, currentTimeOpen);
+                        } else {
+                            // Puerta cerrada, detener alertas
+                            clearInterval(intervalId);
+                            alertIntervals.delete(username);
+                            console.log(`✅ ${username}: Alertas detenidas (puerta cerrada)`);
                         }
-                    );
-                    notificationPromises.push(promise);
+                    }, 20000); // ⬅️ Cada 20 segundos
+
+                    alertIntervals.set(username, intervalId);
+                    console.log(`⏰ ${username}: Loop de alertas iniciado (cada 20s)`);
                 }
 
-                await Promise.all(notificationPromises);
                 state.alertSent = true;
             }
         }
@@ -570,6 +615,13 @@ async function handleDoorEvents(username, data) {
     // PUERTA SE CIERRA
     else if (currentStatus === 'closed' && previousStatus === 'open') {
         console.log(`🔒 ${username}: PUERTA CERRADA`);
+
+        // ⬇️ NUEVO: Detener alertas repetidas
+        if (alertIntervals.has(username)) {
+            clearInterval(alertIntervals.get(username));
+            alertIntervals.delete(username);
+            console.log(`🛑 ${username}: Alertas detenidas`);
+        }
 
         if (state.currentEvent) {
             try {
@@ -605,7 +657,6 @@ async function handleDoorEvents(username, data) {
     doorState.set(username, state);
 }
 
-// Health check para WebSockets
 setInterval(() => {
     const now = Date.now();
 
@@ -622,7 +673,6 @@ setInterval(() => {
     });
 }, 30000);
 
-// Limpiar sensores inactivos
 setInterval(() => {
     console.log('🧹 Limpiando sensores inactivos...');
     const now = Date.now();
@@ -638,11 +688,10 @@ setInterval(() => {
     }
 }, 10 * 60 * 1000);
 
-// ⬇️ NUEVO: Limpiar tokens FCM viejos
 setInterval(() => {
     console.log('🧹 Limpiando tokens FCM viejos...');
     const now = Date.now();
-    const maxAge = 24 * 60 * 60 * 1000; // 24 horas
+    const maxAge = 24 * 60 * 60 * 1000;
 
     for (const [observerId, tokenData] of fcmTokens.entries()) {
         if (typeof tokenData === 'object' && tokenData.registeredAt) {
