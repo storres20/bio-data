@@ -156,6 +156,25 @@ app.get('/api/simulations', async (req, res) => {
     }
 });
 
+// ⬇️ NUEVO: Endpoint para obtener eventos de TODAS las puertas
+app.get('/api/door-events/all', async (req, res) => {
+    try {
+        const { limit = 100, status } = req.query;
+
+        const query = {};
+        if (status) query.status = status;
+
+        const events = await DoorEvent.find(query)
+            .sort({ opened_at: -1 }) // Más recientes primero
+            .limit(parseInt(limit));
+
+        res.json(events);
+    } catch (err) {
+        console.error('❌ Error fetching all door events:', err);
+        res.status(500).json({ error: 'Error fetching door events' });
+    }
+});
+
 app.get('/api/door-events/:username', async (req, res) => {
     try {
         const { username } = req.params;
