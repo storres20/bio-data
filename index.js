@@ -127,7 +127,6 @@ app.get('/api/debug/fcm-analysis', (req, res) => {
     });
 });
 
-// ⬇️ NUEVO: Endpoint para ver alertas activas
 app.get('/api/debug/active-alerts', (req, res) => {
     const activeAlerts = [];
 
@@ -156,7 +155,6 @@ app.get('/api/simulations', async (req, res) => {
     }
 });
 
-// ⬇️ NUEVO: Endpoint para obtener eventos de TODAS las puertas
 app.get('/api/door-events/all', async (req, res) => {
     try {
         const { limit = 100, status } = req.query;
@@ -165,7 +163,7 @@ app.get('/api/door-events/all', async (req, res) => {
         if (status) query.status = status;
 
         const events = await DoorEvent.find(query)
-            .sort({ opened_at: -1 }) // Más recientes primero
+            .sort({ opened_at: -1 })
             .limit(parseInt(limit));
 
         res.json(events);
@@ -253,7 +251,7 @@ async function sendPushNotification(observerId, title, body, data = {}) {
             android: {
                 priority: 'high',
                 notification: {
-                    channelId: 'door_alerts',
+                    channelId: 'mhutemp-alerts',
                     sound: 'default',
                     priority: 'high',
                     defaultVibrateTimings: true,
@@ -276,31 +274,62 @@ async function sendPushNotification(observerId, title, body, data = {}) {
     }
 }
 
-// ⬇️ NUEVA FUNCIÓN: Enviar alerta a todos los observadores
-async function sendAlertToAllObservers(username, data, timeOpen) {
+// ⬇️ FUNCIÓN MODIFICADA: Enviar alertas con diferentes tipos
+async function sendAlertToAllObservers(username, data, alertType = 'door', timeOpen = 0, tempDuration = 0) {
     const notificationPromises = [];
     const totalObservers = fcmTokens.size;
 
-    console.log(`📤 Enviando alerta a ${totalObservers} dispositivos...`);
+    let title, body, extraData = {};
+
+    // Determinar tipo de alerta
+    if (alertType === 'critical') {
+        // Puerta abierta + temperatura crítica
+        const tempStatus = data.dsTemperature < 1 ? 'TOO LOW' : 'TOO HIGH';
+        title = '🚨 CRITICAL ALERT';
+        body = `${username}: Door open (${Math.floor(timeOpen/1000)}s) + Temp ${data.dsTemperature}°C (${tempStatus})`;
+        extraData.alertType = 'critical';
+
+    } else if (alertType === 'door') {
+        // Solo puerta abierta
+        title = '🚨 DOOR ALERT';
+        body = `${username}: Door has been open for ${Math.floor(timeOpen/1000)} seconds!`;
+        extraData.alertType = 'door';
+
+    } else if (alertType === 'temp_low') {
+        // Solo temperatura baja
+        title = '❄️ LOW TEMPERATURE';
+        body = `${username}: Temperature ${data.dsTemperature}°C (${Math.floor(tempDuration/60000)} min below 1°C)`;
+        extraData.alertType = 'temp_low';
+
+    } else if (alertType === 'temp_high') {
+        // Solo temperatura alta
+        title = '🔥 HIGH TEMPERATURE';
+        body = `${username}: Temperature ${data.dsTemperature}°C (${Math.floor(tempDuration/60000)} min above 6°C)`;
+        extraData.alertType = 'temp_high';
+    }
+
+    console.log(`📤 Enviando alerta [${alertType.toUpperCase()}] a ${totalObservers} dispositivos...`);
 
     for (const [observerId, tokenData] of fcmTokens.entries()) {
         const promise = sendPushNotification(
             observerId,
-            '🚨 DOOR ALERT',
-            `${username}: Door has been open for ${Math.floor(timeOpen/1000)} seconds!`,
+            title,
+            body,
             {
-                type: 'door_alert',
+                type: alertType,
                 username: username,
                 temperature: data.dsTemperature.toString(),
                 timeOpen: Math.floor(timeOpen / 1000).toString(),
+                tempDuration: Math.floor(tempDuration / 1000).toString(),
                 timestamp: Date.now().toString(),
+                ...extraData
             }
         );
         notificationPromises.push(promise);
     }
 
     await Promise.all(notificationPromises);
-    console.log(`✅ Alerta enviada a ${totalObservers} dispositivos`);
+    console.log(`✅ Alerta [${alertType.toUpperCase()}] enviada a ${totalObservers} dispositivos`);
 }
 
 const server = http.createServer(app);
@@ -309,7 +338,13 @@ const latestDataPerSensor = new Map();
 const userConnections = new Map();
 const doorState = new Map();
 const fcmTokens = new Map();
-const alertIntervals = new Map(); // ⬅️ NUEVO: Almacenar intervalos de alertas
+const alertIntervals = new Map();
+const tempAlertState = new Map(); // ⬅️ NUEVO: Estado de alertas de temperatura
+const tempAlertIntervals = new Map(); // ⬅️ NUEVO: Intervalos de alertas de temperatura
+
+// ⬇️ NUEVO: Constantes de configuración de alertas
+const ALERT_DELAY = 60000;        // 1 minuto
+const ALERT_INTERVAL = 20000;     // 20 segundos
 
 server.on('upgrade', (req, socket, head) => {
     console.log("📡 Upgrade request for WebSocket");
@@ -399,6 +434,7 @@ wss.on('connection', (ws) => {
             await saveTo10MinData(username, parsed);
             await saveTo4HData(username, parsed);
             await handleDoorEvents(username, parsed);
+            await handleTemperatureAlerts(username, parsed); // ⬅️ NUEVO: Manejar alertas de temperatura
 
             wss.clients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) {
@@ -423,11 +459,22 @@ wss.on('connection', (ws) => {
             if (userConnections.get(username).size === 0) {
                 userConnections.delete(username);
 
-                // ⬇️ NUEVO: Limpiar alertas cuando sensor se desconecta
+                // Limpiar alertas de puerta
                 if (alertIntervals.has(username)) {
                     clearInterval(alertIntervals.get(username));
                     alertIntervals.delete(username);
-                    console.log(`🛑 ${username}: Alertas detenidas (sensor desconectado)`);
+                    console.log(`🛑 ${username}: Alertas de puerta detenidas (sensor desconectado)`);
+                }
+
+                // ⬇️ NUEVO: Limpiar alertas de temperatura
+                if (tempAlertIntervals.has(username)) {
+                    clearInterval(tempAlertIntervals.get(username));
+                    tempAlertIntervals.delete(username);
+                    console.log(`🛑 ${username}: Alertas de temp detenidas (sensor desconectado)`);
+                }
+
+                if (tempAlertState.has(username)) {
+                    tempAlertState.delete(username);
                 }
 
                 if (latestDataPerSensor.has(username)) {
@@ -557,13 +604,126 @@ async function saveTo4HData(username, data) {
     }
 }
 
-// ⬇️ MODIFICADO: Sistema de alertas repetidas
+// ⬇️ NUEVA FUNCIÓN: Manejar alertas de temperatura
+async function handleTemperatureAlerts(username, data) {
+    const temp = parseFloat(data.dsTemperature);
+    const now = Date.now();
+    const doorStateData = doorState.get(username);
+
+    // Verificar si está fuera de rango (<1°C o >6°C)
+    const isCritical = temp < 1 || temp > 6;
+
+    if (isCritical) {
+        const state = tempAlertState.get(username);
+        const type = temp < 1 ? 'low' : 'high';
+
+        if (!state) {
+            // Primera vez fuera de rango
+            tempAlertState.set(username, {
+                startTime: now,
+                lastAlertTime: 0,
+                temperature: temp,
+                type: type,
+                alertSent: false
+            });
+            console.log(`🌡️ ${username}: Temperatura ${type === 'low' ? 'BAJA' : 'ALTA'}: ${temp}°C`);
+
+        } else {
+            const duration = now - state.startTime;
+
+            // Alerta después de 1 minuto
+            if (duration > ALERT_DELAY && !state.alertSent) {
+                console.log(`🚨 ${username}: TEMPERATURA ${type === 'low' ? 'BAJA' : 'ALTA'} >1 MIN`);
+
+                // Verificar si hay alerta combinada (puerta abierta + temp crítica)
+                const isDoorOpen = doorStateData?.status === 'open';
+                const doorTimeOpen = isDoorOpen ? (now - doorStateData.doorOpenedAt) : 0;
+
+                let alertType;
+                if (isDoorOpen && doorTimeOpen > ALERT_DELAY) {
+                    // CRÍTICO: Puerta abierta + temperatura fuera de rango
+                    alertType = 'critical';
+                    await sendAlertToAllObservers(username, data, alertType, doorTimeOpen, duration);
+                } else {
+                    // Solo temperatura
+                    alertType = type === 'low' ? 'temp_low' : 'temp_high';
+                    await sendAlertToAllObservers(username, data, alertType, 0, duration);
+                }
+
+                // Iniciar loop de alertas cada 20 segundos
+                if (!tempAlertIntervals.has(username)) {
+                    const intervalId = setInterval(async () => {
+                        const currentState = tempAlertState.get(username);
+                        const currentDoorState = doorState.get(username);
+
+                        if (currentState) {
+                            const currentDuration = Date.now() - currentState.startTime;
+                            const currentTemp = currentState.temperature;
+
+                            // Verificar si sigue fuera de rango
+                            if (currentTemp < 1 || currentTemp > 6) {
+                                // Verificar combinación con puerta
+                                const isDoorStillOpen = currentDoorState?.status === 'open';
+                                const currentDoorTime = isDoorStillOpen ? (Date.now() - currentDoorState.doorOpenedAt) : 0;
+
+                                let repeatAlertType;
+                                if (isDoorStillOpen && currentDoorTime > ALERT_DELAY) {
+                                    repeatAlertType = 'critical';
+                                    console.log(`🔔 ${username}: Alerta CRÍTICA repetida (puerta ${Math.floor(currentDoorTime/1000)}s + temp ${Math.floor(currentDuration/1000)}s)`);
+                                    await sendAlertToAllObservers(username, data, repeatAlertType, currentDoorTime, currentDuration);
+                                } else {
+                                    repeatAlertType = currentState.type === 'low' ? 'temp_low' : 'temp_high';
+                                    console.log(`🔔 ${username}: Alerta temp repetida (${Math.floor(currentDuration/1000)}s fuera de rango)`);
+                                    await sendAlertToAllObservers(username, data, repeatAlertType, 0, currentDuration);
+                                }
+                            } else {
+                                // Temperatura normalizada
+                                clearInterval(intervalId);
+                                tempAlertIntervals.delete(username);
+                                console.log(`✅ ${username}: Alertas de temp detenidas (normalizada)`);
+                            }
+                        } else {
+                            clearInterval(intervalId);
+                            tempAlertIntervals.delete(username);
+                        }
+                    }, ALERT_INTERVAL); // 20 segundos
+
+                    tempAlertIntervals.set(username, intervalId);
+                    console.log(`⏰ ${username}: Loop de alertas temp iniciado (cada 20s)`);
+                }
+
+                state.alertSent = true;
+            }
+
+            // Actualizar temperatura actual
+            state.temperature = temp;
+            state.type = type;
+        }
+    } else {
+        // Temperatura en rango normal (1-6°C)
+        if (tempAlertState.has(username)) {
+            console.log(`✅ ${username}: Temperatura normalizada: ${temp}°C`);
+
+            // Detener alertas
+            if (tempAlertIntervals.has(username)) {
+                clearInterval(tempAlertIntervals.get(username));
+                tempAlertIntervals.delete(username);
+            }
+
+            tempAlertState.delete(username);
+        }
+    }
+}
+
+// ⬇️ FUNCIÓN MODIFICADA: Manejar eventos de puerta (con integración de temperatura)
 async function handleDoorEvents(username, data) {
     const state = doorState.get(username);
     if (!state || !data.doorStatus) return;
 
     const currentStatus = data.doorStatus;
     const previousStatus = state.status;
+    const temp = parseFloat(data.dsTemperature);
+    const isTempCritical = temp < 1 || temp > 6;
 
     // PUERTA SE ABRE
     if (currentStatus === 'open' && previousStatus === 'closed') {
@@ -598,32 +758,56 @@ async function handleDoorEvents(username, data) {
         if (state.doorOpenedAt && !state.alertSent) {
             const timeOpen = Date.now() - state.doorOpenedAt;
 
-            if (timeOpen > 60000) {
-                console.log(`🚨 ${username}: PUERTA ABIERTA >1 MIN - Iniciando alertas repetidas`);
+            if (timeOpen > ALERT_DELAY) { // 1 minuto
+                // Verificar si hay alerta de temperatura activa
+                const tempState = tempAlertState.get(username);
+                const hasTempAlert = tempState && tempState.alertSent;
 
-                // ⬇️ Enviar primera alerta
-                await sendAlertToAllObservers(username, data, timeOpen);
+                let alertType = 'door';
 
-                // ⬇️ NUEVO: Iniciar loop de alertas cada 20 segundos
+                // Si temperatura también está crítica, enviar alerta combinada
+                if (isTempCritical && hasTempAlert) {
+                    alertType = 'critical';
+                    const tempDuration = Date.now() - tempState.startTime;
+                    console.log(`🚨 ${username}: ALERTA CRÍTICA - Puerta abierta >1min + Temperatura ${temp < 1 ? 'BAJA' : 'ALTA'}`);
+                    await sendAlertToAllObservers(username, data, alertType, timeOpen, tempDuration);
+                } else {
+                    console.log(`🚨 ${username}: PUERTA ABIERTA >1 MIN`);
+                    await sendAlertToAllObservers(username, data, alertType, timeOpen, 0);
+                }
+
+                // Loop de alertas cada 20 segundos
                 if (!alertIntervals.has(username)) {
                     const intervalId = setInterval(async () => {
                         const currentState = doorState.get(username);
 
-                        // Verificar si la puerta sigue abierta
                         if (currentState && currentState.status === 'open') {
                             const currentTimeOpen = Date.now() - currentState.doorOpenedAt;
-                            console.log(`🔔 ${username}: Enviando alerta repetida (${Math.floor(currentTimeOpen/1000)}s abierta)`);
-                            await sendAlertToAllObservers(username, data, currentTimeOpen);
+                            const currentTempState = tempAlertState.get(username);
+                            const isStillTempCritical = data.dsTemperature < 1 || data.dsTemperature > 6;
+
+                            // Determinar tipo de alerta
+                            let repeatAlertType = 'door';
+                            let tempDur = 0;
+
+                            if (isStillTempCritical && currentTempState) {
+                                repeatAlertType = 'critical';
+                                tempDur = Date.now() - currentTempState.startTime;
+                                console.log(`🔔 ${username}: Alerta CRÍTICA repetida (${Math.floor(currentTimeOpen/1000)}s abierta + temp crítica)`);
+                            } else {
+                                console.log(`🔔 ${username}: Alerta puerta repetida (${Math.floor(currentTimeOpen/1000)}s abierta)`);
+                            }
+
+                            await sendAlertToAllObservers(username, data, repeatAlertType, currentTimeOpen, tempDur);
                         } else {
-                            // Puerta cerrada, detener alertas
                             clearInterval(intervalId);
                             alertIntervals.delete(username);
-                            console.log(`✅ ${username}: Alertas detenidas (puerta cerrada)`);
+                            console.log(`✅ ${username}: Alertas de puerta detenidas (puerta cerrada)`);
                         }
-                    }, 20000); // ⬅️ Cada 20 segundos
+                    }, ALERT_INTERVAL); // 20 segundos
 
                     alertIntervals.set(username, intervalId);
-                    console.log(`⏰ ${username}: Loop de alertas iniciado (cada 20s)`);
+                    console.log(`⏰ ${username}: Loop de alertas puerta iniciado (cada 20s)`);
                 }
 
                 state.alertSent = true;
@@ -635,11 +819,10 @@ async function handleDoorEvents(username, data) {
     else if (currentStatus === 'closed' && previousStatus === 'open') {
         console.log(`🔒 ${username}: PUERTA CERRADA`);
 
-        // ⬇️ NUEVO: Detener alertas repetidas
         if (alertIntervals.has(username)) {
             clearInterval(alertIntervals.get(username));
             alertIntervals.delete(username);
-            console.log(`🛑 ${username}: Alertas detenidas`);
+            console.log(`🛑 ${username}: Alertas de puerta detenidas`);
         }
 
         if (state.currentEvent) {
