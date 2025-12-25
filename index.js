@@ -416,21 +416,10 @@ wss.on('connection', (ws) => {
                 return;
             }
 
-            /*if (!parsed.temperature || !parsed.humidity || !parsed.dsTemperature || !parsed.datetime) {
-                console.log(`⚠️ ${username}: Mensaje incompleto, esperando datos...`);
-                return;
-            }*/
-
-            if (
-                parsed.temperature === undefined ||
-                parsed.humidity === undefined ||
-                parsed.dsTemperature === undefined ||
-                parsed.datetime === undefined
-            ) {
+            if (!parsed.temperature || !parsed.humidity || !parsed.dsTemperature || !parsed.datetime) {
                 console.log(`⚠️ ${username}: Mensaje incompleto, esperando datos...`);
                 return;
             }
-
 
             const currentEntry = latestDataPerSensor.get(username);
             const lastDatetime = currentEntry?.data?.datetime;
