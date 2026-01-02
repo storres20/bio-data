@@ -1,4 +1,4 @@
-// index.js
+// index.js - VERSIÓN ACTUALIZADA CON MANEJO DE SENSORES DESCONECTADOS
 
 require('dotenv').config();
 
@@ -205,7 +205,8 @@ app.get('/api/v1/datas/temp-extremes/:username', async (req, res) => {
             datetime: {
                 $gte: today,
                 $lt: tomorrow
-            }
+            },
+            dsTemperature: { $ne: null } // ⬅️ NUEVO: Excluir valores null
         }).sort({ dsTemperature: 1 });
 
         if (data.length === 0) {
@@ -274,7 +275,6 @@ async function sendPushNotification(observerId, title, body, data = {}) {
     }
 }
 
-// ⬇️ FUNCIÓN MODIFICADA: Enviar alertas con diferentes tipos
 async function sendAlertToAllObservers(username, data, alertType = 'door', timeOpen = 0, tempDuration = 0) {
     const notificationPromises = [];
     const totalObservers = fcmTokens.size;
@@ -283,26 +283,22 @@ async function sendAlertToAllObservers(username, data, alertType = 'door', timeO
 
     // Determinar tipo de alerta
     if (alertType === 'critical') {
-        // Puerta abierta + temperatura crítica
         const tempStatus = data.dsTemperature < 1 ? 'TOO LOW' : 'TOO HIGH';
         title = '🚨 CRITICAL ALERT';
         body = `${username}: Door open (${Math.floor(timeOpen/1000)}s) + Temp ${data.dsTemperature}°C (${tempStatus})`;
         extraData.alertType = 'critical';
 
     } else if (alertType === 'door') {
-        // Solo puerta abierta
         title = '🚨 DOOR ALERT';
         body = `${username}: Door has been open for ${Math.floor(timeOpen/1000)} seconds!`;
         extraData.alertType = 'door';
 
     } else if (alertType === 'temp_low') {
-        // Solo temperatura baja
         title = '❄️ LOW TEMPERATURE';
         body = `${username}: Temperature ${data.dsTemperature}°C (${Math.floor(tempDuration/60000)} min below 1°C)`;
         extraData.alertType = 'temp_low';
 
     } else if (alertType === 'temp_high') {
-        // Solo temperatura alta
         title = '🔥 HIGH TEMPERATURE';
         body = `${username}: Temperature ${data.dsTemperature}°C (${Math.floor(tempDuration/60000)} min above 6°C)`;
         extraData.alertType = 'temp_high';
@@ -318,7 +314,7 @@ async function sendAlertToAllObservers(username, data, alertType = 'door', timeO
             {
                 type: alertType,
                 username: username,
-                temperature: data.dsTemperature.toString(),
+                temperature: data.dsTemperature !== null ? data.dsTemperature.toString() : 'N/A',
                 timeOpen: Math.floor(timeOpen / 1000).toString(),
                 tempDuration: Math.floor(tempDuration / 1000).toString(),
                 timestamp: Date.now().toString(),
@@ -339,10 +335,9 @@ const userConnections = new Map();
 const doorState = new Map();
 const fcmTokens = new Map();
 const alertIntervals = new Map();
-const tempAlertState = new Map(); // ⬅️ NUEVO: Estado de alertas de temperatura
-const tempAlertIntervals = new Map(); // ⬅️ NUEVO: Intervalos de alertas de temperatura
+const tempAlertState = new Map();
+const tempAlertIntervals = new Map();
 
-// ⬇️ NUEVO: Constantes de configuración de alertas
 const ALERT_DELAY = 60000;        // 1 minuto
 const ALERT_INTERVAL = 20000;     // 20 segundos
 
@@ -352,6 +347,41 @@ server.on('upgrade', (req, socket, head) => {
         wss.emit('connection', ws, req);
     });
 });
+
+// ⬇️ NUEVA FUNCIÓN: Validar datos de sensores
+function validateSensorData(parsed) {
+    // Verificar campos obligatorios
+    if (!parsed.username || !parsed.datetime) {
+        return {
+            valid: false,
+            reason: 'Missing username or datetime'
+        };
+    }
+
+    // Permitir null pero verificar tipo
+    const hasValidTemp = parsed.temperature === null || typeof parsed.temperature === 'number';
+    const hasValidHumidity = parsed.humidity === null || typeof parsed.humidity === 'number';
+    const hasValidDsTemp = parsed.dsTemperature === null || typeof parsed.dsTemperature === 'number';
+
+    if (!hasValidTemp || !hasValidHumidity || !hasValidDsTemp) {
+        return {
+            valid: false,
+            reason: 'Invalid sensor data types'
+        };
+    }
+
+    // Indicar qué sensores están activos
+    const activeSensors = {
+        dht: parsed.temperature !== null && parsed.humidity !== null,
+        ds18b20: parsed.dsTemperature !== null,
+        door: typeof parsed.doorStatus === 'string'
+    };
+
+    return {
+        valid: true,
+        activeSensors: activeSensors
+    };
+}
 
 wss.on('connection', (ws) => {
     console.log('✅ New WebSocket connection established');
@@ -416,10 +446,25 @@ wss.on('connection', (ws) => {
                 return;
             }
 
-            if (!parsed.temperature || !parsed.humidity || !parsed.dsTemperature || !parsed.datetime) {
-                console.log(`⚠️ ${username}: Mensaje incompleto, esperando datos...`);
+            // ⬇️ NUEVA VALIDACIÓN
+            const validation = validateSensorData(parsed);
+
+            if (!validation.valid) {
+                console.log(`⚠️ ${username}: ${validation.reason}, esperando datos...`);
                 return;
             }
+
+            // ⬇️ LOG MEJORADO: Indicar qué sensores están activos
+            const sensorStatus = [];
+            if (validation.activeSensors.dht) sensorStatus.push('DHT✓');
+            else sensorStatus.push('DHT✗');
+
+            if (validation.activeSensors.ds18b20) sensorStatus.push('DS18B20✓');
+            else sensorStatus.push('DS18B20✗');
+
+            if (validation.activeSensors.door) sensorStatus.push(`Door:${parsed.doorStatus}`);
+
+            console.log(`📡 ${username}: ${sensorStatus.join(' | ')}`);
 
             const currentEntry = latestDataPerSensor.get(username);
             const lastDatetime = currentEntry?.data?.datetime;
@@ -431,10 +476,14 @@ wss.on('connection', (ws) => {
                 });
             }
 
-            await saveTo10MinData(username, parsed);
-            await saveTo4HData(username, parsed);
+            // Guardar datos solo si hay al menos un sensor activo
+            if (validation.activeSensors.dht || validation.activeSensors.ds18b20) {
+                await saveTo10MinData(username, parsed);
+                await saveTo4HData(username, parsed);
+            }
+
             await handleDoorEvents(username, parsed);
-            await handleTemperatureAlerts(username, parsed); // ⬅️ NUEVO: Manejar alertas de temperatura
+            await handleTemperatureAlerts(username, parsed);
 
             wss.clients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) {
@@ -459,14 +508,12 @@ wss.on('connection', (ws) => {
             if (userConnections.get(username).size === 0) {
                 userConnections.delete(username);
 
-                // Limpiar alertas de puerta
                 if (alertIntervals.has(username)) {
                     clearInterval(alertIntervals.get(username));
                     alertIntervals.delete(username);
                     console.log(`🛑 ${username}: Alertas de puerta detenidas (sensor desconectado)`);
                 }
 
-                // ⬇️ NUEVO: Limpiar alertas de temperatura
                 if (tempAlertIntervals.has(username)) {
                     clearInterval(tempAlertIntervals.get(username));
                     tempAlertIntervals.delete(username);
@@ -530,6 +577,7 @@ function get4HSlot(datetime) {
     return date;
 }
 
+// ⬇️ FUNCIÓN MODIFICADA: Guardar con valores null
 async function saveTo10MinData(username, data) {
     try {
         const slot = get10MinSlot(data.datetime);
@@ -542,9 +590,9 @@ async function saveTo10MinData(username, data) {
         const device = await Device.findOne({ assigned_sensor_username: username });
 
         const tenMinData = new TenMinData({
-            temperature: parseFloat(data.temperature),
-            humidity: parseFloat(data.humidity),
-            dsTemperature: parseFloat(data.dsTemperature),
+            temperature: data.temperature !== null ? parseFloat(data.temperature) : null,
+            humidity: data.humidity !== null ? parseFloat(data.humidity) : null,
+            dsTemperature: data.dsTemperature !== null ? parseFloat(data.dsTemperature) : null,
             username: username,
             datetime: new Date(data.datetime),
             device_id: device ? device._id : null,
@@ -559,7 +607,12 @@ async function saveTo10MinData(username, data) {
             doorState.set(username, state);
         }
 
-        console.log(`📊 10MIN: ${username} → Slot ${slot.toISOString()} - T.OUT: ${data.dsTemperature}°C - Door: ${data.doorStatus || 'N/A'}`);
+        // Log mejorado
+        const tempOut = data.dsTemperature !== null ? `${data.dsTemperature}°C` : 'N/A';
+        const tempIn = data.temperature !== null ? `${data.temperature}°C` : 'N/A';
+        const humidity = data.humidity !== null ? `${data.humidity}%` : 'N/A';
+
+        console.log(`📊 10MIN: ${username} → Slot ${slot.toISOString()} - T.OUT: ${tempOut} | T.IN: ${tempIn} | H: ${humidity} | Door: ${data.doorStatus || 'N/A'}`);
     } catch (err) {
         if (err.code !== 11000) {
             console.error(`❌ Error guardando en 10mindata:`, err.message);
@@ -579,9 +632,9 @@ async function saveTo4HData(username, data) {
         const device = await Device.findOne({ assigned_sensor_username: username });
 
         const fourHData = new FourHData({
-            temperature: parseFloat(data.temperature),
-            humidity: parseFloat(data.humidity),
-            dsTemperature: parseFloat(data.dsTemperature),
+            temperature: data.temperature !== null ? parseFloat(data.temperature) : null,
+            humidity: data.humidity !== null ? parseFloat(data.humidity) : null,
+            dsTemperature: data.dsTemperature !== null ? parseFloat(data.dsTemperature) : null,
             username: username,
             datetime: new Date(data.datetime),
             device_id: device ? device._id : null,
@@ -596,7 +649,8 @@ async function saveTo4HData(username, data) {
             doorState.set(username, state);
         }
 
-        console.log(`📈 4H: ${username} → Slot ${slot.toISOString()} - T.OUT: ${data.dsTemperature}°C - Door: ${data.doorStatus || 'N/A'}`);
+        const tempOut = data.dsTemperature !== null ? `${data.dsTemperature}°C` : 'N/A';
+        console.log(`📈 4H: ${username} → Slot ${slot.toISOString()} - T.OUT: ${tempOut} - Door: ${data.doorStatus || 'N/A'}`);
     } catch (err) {
         if (err.code !== 11000) {
             console.error(`❌ Error guardando en 4hdata:`, err.message);
@@ -604,13 +658,28 @@ async function saveTo4HData(username, data) {
     }
 }
 
-// ⬇️ NUEVA FUNCIÓN: Manejar alertas de temperatura
+// ⬇️ FUNCIÓN MODIFICADA: Solo procesar si dsTemperature no es null
 async function handleTemperatureAlerts(username, data) {
+    // Solo procesar si dsTemperature no es null
+    if (data.dsTemperature === null) {
+        // Si el sensor se desconectó, limpiar alertas activas
+        if (tempAlertState.has(username)) {
+            console.log(`🛑 ${username}: Alerta temp cancelada (sensor desconectado)`);
+
+            if (tempAlertIntervals.has(username)) {
+                clearInterval(tempAlertIntervals.get(username));
+                tempAlertIntervals.delete(username);
+            }
+
+            tempAlertState.delete(username);
+        }
+        return;
+    }
+
     const temp = parseFloat(data.dsTemperature);
     const now = Date.now();
     const doorStateData = doorState.get(username);
 
-    // Verificar si está fuera de rango (<1°C o >6°C)
     const isCritical = temp < 1 || temp > 6;
 
     if (isCritical) {
@@ -618,7 +687,6 @@ async function handleTemperatureAlerts(username, data) {
         const type = temp < 1 ? 'low' : 'high';
 
         if (!state) {
-            // Primera vez fuera de rango
             tempAlertState.set(username, {
                 startTime: now,
                 lastAlertTime: 0,
@@ -631,26 +699,21 @@ async function handleTemperatureAlerts(username, data) {
         } else {
             const duration = now - state.startTime;
 
-            // Alerta después de 1 minuto
             if (duration > ALERT_DELAY && !state.alertSent) {
                 console.log(`🚨 ${username}: TEMPERATURA ${type === 'low' ? 'BAJA' : 'ALTA'} >1 MIN`);
 
-                // Verificar si hay alerta combinada (puerta abierta + temp crítica)
                 const isDoorOpen = doorStateData?.status === 'open';
                 const doorTimeOpen = isDoorOpen ? (now - doorStateData.doorOpenedAt) : 0;
 
                 let alertType;
                 if (isDoorOpen && doorTimeOpen > ALERT_DELAY) {
-                    // CRÍTICO: Puerta abierta + temperatura fuera de rango
                     alertType = 'critical';
                     await sendAlertToAllObservers(username, data, alertType, doorTimeOpen, duration);
                 } else {
-                    // Solo temperatura
                     alertType = type === 'low' ? 'temp_low' : 'temp_high';
                     await sendAlertToAllObservers(username, data, alertType, 0, duration);
                 }
 
-                // Iniciar loop de alertas cada 20 segundos
                 if (!tempAlertIntervals.has(username)) {
                     const intervalId = setInterval(async () => {
                         const currentState = tempAlertState.get(username);
@@ -660,9 +723,7 @@ async function handleTemperatureAlerts(username, data) {
                             const currentDuration = Date.now() - currentState.startTime;
                             const currentTemp = currentState.temperature;
 
-                            // Verificar si sigue fuera de rango
                             if (currentTemp < 1 || currentTemp > 6) {
-                                // Verificar combinación con puerta
                                 const isDoorStillOpen = currentDoorState?.status === 'open';
                                 const currentDoorTime = isDoorStillOpen ? (Date.now() - currentDoorState.doorOpenedAt) : 0;
 
@@ -677,7 +738,6 @@ async function handleTemperatureAlerts(username, data) {
                                     await sendAlertToAllObservers(username, data, repeatAlertType, 0, currentDuration);
                                 }
                             } else {
-                                // Temperatura normalizada
                                 clearInterval(intervalId);
                                 tempAlertIntervals.delete(username);
                                 console.log(`✅ ${username}: Alertas de temp detenidas (normalizada)`);
@@ -686,7 +746,7 @@ async function handleTemperatureAlerts(username, data) {
                             clearInterval(intervalId);
                             tempAlertIntervals.delete(username);
                         }
-                    }, ALERT_INTERVAL); // 20 segundos
+                    }, ALERT_INTERVAL);
 
                     tempAlertIntervals.set(username, intervalId);
                     console.log(`⏰ ${username}: Loop de alertas temp iniciado (cada 20s)`);
@@ -695,16 +755,13 @@ async function handleTemperatureAlerts(username, data) {
                 state.alertSent = true;
             }
 
-            // Actualizar temperatura actual
             state.temperature = temp;
             state.type = type;
         }
     } else {
-        // Temperatura en rango normal (1-6°C)
         if (tempAlertState.has(username)) {
             console.log(`✅ ${username}: Temperatura normalizada: ${temp}°C`);
 
-            // Detener alertas
             if (tempAlertIntervals.has(username)) {
                 clearInterval(tempAlertIntervals.get(username));
                 tempAlertIntervals.delete(username);
@@ -715,15 +772,14 @@ async function handleTemperatureAlerts(username, data) {
     }
 }
 
-// ⬇️ FUNCIÓN MODIFICADA: Manejar eventos de puerta (con integración de temperatura)
 async function handleDoorEvents(username, data) {
     const state = doorState.get(username);
     if (!state || !data.doorStatus) return;
 
     const currentStatus = data.doorStatus;
     const previousStatus = state.status;
-    const temp = parseFloat(data.dsTemperature);
-    const isTempCritical = temp < 1 || temp > 6;
+    const temp = data.dsTemperature !== null ? parseFloat(data.dsTemperature) : null;
+    const isTempCritical = temp !== null && (temp < 1 || temp > 6);
 
     // PUERTA SE ABRE
     if (currentStatus === 'open' && previousStatus === 'closed') {
@@ -735,9 +791,9 @@ async function handleDoorEvents(username, data) {
             const newEvent = new DoorEvent({
                 username: username,
                 opened_at: new Date(data.datetime),
-                temp_OUT_before: parseFloat(data.dsTemperature),
-                temp_IN_before: parseFloat(data.temperature),
-                humidity_before: parseFloat(data.humidity),
+                temp_OUT_before: data.dsTemperature !== null ? parseFloat(data.dsTemperature) : null,
+                temp_IN_before: data.temperature !== null ? parseFloat(data.temperature) : null,
+                humidity_before: data.humidity !== null ? parseFloat(data.humidity) : null,
                 device_id: device ? device._id : null,
                 status: 'in_progress'
             });
@@ -753,19 +809,17 @@ async function handleDoorEvents(username, data) {
         }
     }
 
-    // PUERTA SIGUE ABIERTA - Verificar alerta
+    // PUERTA SIGUE ABIERTA
     else if (currentStatus === 'open' && previousStatus === 'open') {
         if (state.doorOpenedAt && !state.alertSent) {
             const timeOpen = Date.now() - state.doorOpenedAt;
 
-            if (timeOpen > ALERT_DELAY) { // 1 minuto
-                // Verificar si hay alerta de temperatura activa
+            if (timeOpen > ALERT_DELAY) {
                 const tempState = tempAlertState.get(username);
                 const hasTempAlert = tempState && tempState.alertSent;
 
                 let alertType = 'door';
 
-                // Si temperatura también está crítica, enviar alerta combinada
                 if (isTempCritical && hasTempAlert) {
                     alertType = 'critical';
                     const tempDuration = Date.now() - tempState.startTime;
@@ -776,7 +830,6 @@ async function handleDoorEvents(username, data) {
                     await sendAlertToAllObservers(username, data, alertType, timeOpen, 0);
                 }
 
-                // Loop de alertas cada 20 segundos
                 if (!alertIntervals.has(username)) {
                     const intervalId = setInterval(async () => {
                         const currentState = doorState.get(username);
@@ -784,9 +837,8 @@ async function handleDoorEvents(username, data) {
                         if (currentState && currentState.status === 'open') {
                             const currentTimeOpen = Date.now() - currentState.doorOpenedAt;
                             const currentTempState = tempAlertState.get(username);
-                            const isStillTempCritical = data.dsTemperature < 1 || data.dsTemperature > 6;
+                            const isStillTempCritical = data.dsTemperature !== null && (data.dsTemperature < 1 || data.dsTemperature > 6);
 
-                            // Determinar tipo de alerta
                             let repeatAlertType = 'door';
                             let tempDur = 0;
 
@@ -804,7 +856,7 @@ async function handleDoorEvents(username, data) {
                             alertIntervals.delete(username);
                             console.log(`✅ ${username}: Alertas de puerta detenidas (puerta cerrada)`);
                         }
-                    }, ALERT_INTERVAL); // 20 segundos
+                    }, ALERT_INTERVAL);
 
                     alertIntervals.set(username, intervalId);
                     console.log(`⏰ ${username}: Loop de alertas puerta iniciado (cada 20s)`);
@@ -832,17 +884,24 @@ async function handleDoorEvents(username, data) {
                     const duration = (new Date(data.datetime) - event.opened_at) / 1000;
 
                     event.closed_at = new Date(data.datetime);
-                    event.temp_OUT_after = parseFloat(data.dsTemperature);
-                    event.temp_IN_after = parseFloat(data.temperature);
-                    event.humidity_after = parseFloat(data.humidity);
+                    event.temp_OUT_after = data.dsTemperature !== null ? parseFloat(data.dsTemperature) : null;
+                    event.temp_IN_after = data.temperature !== null ? parseFloat(data.temperature) : null;
+                    event.humidity_after = data.humidity !== null ? parseFloat(data.humidity) : null;
                     event.duration_seconds = duration;
-                    event.temp_OUT_drop = parseFloat(data.dsTemperature) - event.temp_OUT_before;
-                    event.temp_IN_drop = parseFloat(data.temperature) - event.temp_IN_before;
+
+                    if (event.temp_OUT_before !== null && data.dsTemperature !== null) {
+                        event.temp_OUT_drop = parseFloat(data.dsTemperature) - event.temp_OUT_before;
+                    }
+                    if (event.temp_IN_before !== null && data.temperature !== null) {
+                        event.temp_IN_drop = parseFloat(data.temperature) - event.temp_IN_before;
+                    }
+
                     event.status = 'completed';
 
                     await event.save();
 
-                    console.log(`✅ Evento completado: ${event._id} - Duración: ${duration.toFixed(0)}s - Δ T.OUT: ${event.temp_OUT_drop.toFixed(1)}°C`);
+                    const tempOutDrop = event.temp_OUT_drop !== null ? `${event.temp_OUT_drop.toFixed(1)}°C` : 'N/A';
+                    console.log(`✅ Evento completado: ${event._id} - Duración: ${duration.toFixed(0)}s - Δ T.OUT: ${tempOutDrop}`);
                 }
             } catch (err) {
                 console.error(`❌ Error cerrando evento: ${err.message}`);
