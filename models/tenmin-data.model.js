@@ -1,9 +1,9 @@
 const mongoose = require('mongoose');
 
 const tenMinDataSchema = new mongoose.Schema({
-    temperature: { type: Number, required: true },
-    humidity: { type: Number, required: true },
-    dsTemperature: { type: Number, required: true },
+    temperature: { type: Number, required: false, default: null },
+    humidity: { type: Number, required: false, default: null },
+    dsTemperature: { type: Number, required: false, default: null },
     username: { type: String, required: true },
     datetime: { type: Date, required: true },
     device_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Device' },
