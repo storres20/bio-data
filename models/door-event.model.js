@@ -21,15 +21,15 @@ const doorEventSchema = new mongoose.Schema({
     },
     temp_OUT_before: {
         type: Number,
-        required: true
+        default: null  // ⬅️ Cambiado: permite null si sensor desconectado
     },
     temp_IN_before: {
         type: Number,
-        required: true
+        default: null  // ⬅️ Cambiado: permite null si sensor desconectado
     },
     humidity_before: {
         type: Number,
-        required: true
+        default: null  // ⬅️ Cambiado: permite null si sensor desconectado
     },
 
     // Datos de cierre
@@ -67,7 +67,7 @@ const doorEventSchema = new mongoose.Schema({
     // Estado del evento
     status: {
         type: String,
-        enum: ['in_progress', 'completed'],
+        enum: ['in_progress', 'completed', 'incomplete'],  // ⬅️ Agregado: 'incomplete'
         default: 'in_progress',
         index: true
     },
@@ -76,6 +76,12 @@ const doorEventSchema = new mongoose.Schema({
     notes: {
         type: String,
         default: null
+    },
+
+    // ⬇️ NUEVO: Metadata para trazabilidad (opcional pero recomendado)
+    metadata: {
+        type: Object,
+        default: {}
     }
 }, {
     timestamps: true // Agrega createdAt y updatedAt automáticamente
@@ -84,5 +90,6 @@ const doorEventSchema = new mongoose.Schema({
 // Índice compuesto para búsquedas eficientes
 doorEventSchema.index({ username: 1, opened_at: -1 });
 doorEventSchema.index({ username: 1, status: 1 });
+doorEventSchema.index({ status: 1, opened_at: -1 });  // ⬅️ Nuevo: para limpieza periódica
 
 module.exports = mongoose.model('DoorEvent', doorEventSchema);

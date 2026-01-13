@@ -1,4 +1,4 @@
-// index.js - VERSIÓN ACTUALIZADA CON MANEJO DE SENSORES DESCONECTADOS
+// index.js - VERSIÓN CON RECONEXIÓN INTELIGENTE Y MANEJO DE EVENTOS HUÉRFANOS
 
 require('dotenv').config();
 
@@ -206,7 +206,7 @@ app.get('/api/v1/datas/temp-extremes/:username', async (req, res) => {
                 $gte: today,
                 $lt: tomorrow
             },
-            dsTemperature: { $ne: null } // ⬅️ NUEVO: Excluir valores null
+            dsTemperature: { $ne: null }
         }).sort({ dsTemperature: 1 });
 
         if (data.length === 0) {
@@ -338,8 +338,9 @@ const alertIntervals = new Map();
 const tempAlertState = new Map();
 const tempAlertIntervals = new Map();
 
-const ALERT_DELAY = 60000;        // 1 minuto
-const ALERT_INTERVAL = 20000;     // 20 segundos
+const ALERT_DELAY = 60000;                    // 1 minuto
+const ALERT_INTERVAL = 20000;                 // 20 segundos
+const RECONNECTION_GRACE_PERIOD = 5 * 60 * 1000;  // ⬅️ NUEVO: 5 minutos para esperar reconexión
 
 server.on('upgrade', (req, socket, head) => {
     console.log("📡 Upgrade request for WebSocket");
@@ -348,9 +349,7 @@ server.on('upgrade', (req, socket, head) => {
     });
 });
 
-// ⬇️ NUEVA FUNCIÓN: Validar datos de sensores
 function validateSensorData(parsed) {
-    // Verificar campos obligatorios
     if (!parsed.username || !parsed.datetime) {
         return {
             valid: false,
@@ -358,7 +357,6 @@ function validateSensorData(parsed) {
         };
     }
 
-    // Permitir null pero verificar tipo
     const hasValidTemp = parsed.temperature === null || typeof parsed.temperature === 'number';
     const hasValidHumidity = parsed.humidity === null || typeof parsed.humidity === 'number';
     const hasValidDsTemp = parsed.dsTemperature === null || typeof parsed.dsTemperature === 'number';
@@ -370,7 +368,6 @@ function validateSensorData(parsed) {
         };
     }
 
-    // Indicar qué sensores están activos
     const activeSensors = {
         dht: parsed.temperature !== null && parsed.humidity !== null,
         ds18b20: parsed.dsTemperature !== null,
@@ -421,16 +418,96 @@ wss.on('connection', (ws) => {
                 userConnections.get(username).add(ws);
                 console.log(`➕ WebSocket añadido para ${username}`);
 
-                if (!doorState.has(username)) {
-                    doorState.set(username, {
-                        status: parsed.doorStatus || 'closed',
-                        lastSaved10MinSlot: null,
-                        lastSaved4HSlot: null,
-                        currentEvent: null,
-                        doorOpenedAt: null,
-                        alertSent: false,
-                    });
-                    console.log(`🚪 doorState creado para ${username}`);
+                // ⬇️ NUEVO: Restaurar evento activo si existe uno reciente
+                if (!username.startsWith('MOBILE_OBSERVER_')) {
+                    try {
+                        const recentEvent = await DoorEvent.findOne({
+                            username: username,
+                            status: 'in_progress',
+                            opened_at: { $gte: new Date(Date.now() - RECONNECTION_GRACE_PERIOD) }
+                        }).sort({ opened_at: -1 });
+
+                        if (recentEvent) {
+                            console.log(`🔄 ${username}: Restaurando evento activo tras reconexión: ${recentEvent._id}`);
+
+                            // ⬇️ DETECTAR SI LA PUERTA ESTÁ CERRADA AL RECONECTAR
+                            if (parsed.doorStatus === 'closed') {
+                                console.log(`🔒 ${username}: Puerta cerrada al reconectar - Cerrando evento restaurado`);
+
+                                const closedAt = new Date(parsed.datetime);
+                                const duration = (closedAt - recentEvent.opened_at) / 1000;
+
+                                recentEvent.closed_at = closedAt;
+                                recentEvent.duration_seconds = duration;
+                                recentEvent.temp_OUT_after = parsed.dsTemperature;
+                                recentEvent.temp_IN_after = parsed.temperature;
+                                recentEvent.humidity_after = parsed.humidity;
+
+                                if (recentEvent.temp_OUT_before !== null && parsed.dsTemperature !== null) {
+                                    recentEvent.temp_OUT_drop = parsed.dsTemperature - recentEvent.temp_OUT_before;
+                                }
+                                if (recentEvent.temp_IN_before !== null && parsed.temperature !== null) {
+                                    recentEvent.temp_IN_drop = parsed.temperature - recentEvent.temp_IN_before;
+                                }
+
+                                recentEvent.status = 'completed';
+                                recentEvent.metadata = {
+                                    reconnection: true,
+                                    closed_on_reconnect: true
+                                };
+
+                                await recentEvent.save();
+
+                                console.log(`✅ ${username}: Evento cerrado tras reconexión (duración: ${duration.toFixed(0)}s)`);
+
+                                // Crear doorState con puerta cerrada
+                                doorState.set(username, {
+                                    status: 'closed',
+                                    lastSaved10MinSlot: null,
+                                    lastSaved4HSlot: null,
+                                    currentEvent: null,
+                                    doorOpenedAt: null,
+                                    alertSent: false,
+                                });
+
+                            } else {
+                                // ⬇️ PUERTA SIGUE ABIERTA - RESTAURAR CONTEXTO
+                                console.log(`🚨 ${username}: Puerta sigue abierta tras reconexión - Continuando evento`);
+
+                                doorState.set(username, {
+                                    status: 'open',
+                                    lastSaved10MinSlot: null,
+                                    lastSaved4HSlot: null,
+                                    currentEvent: recentEvent._id,
+                                    doorOpenedAt: recentEvent.opened_at.getTime(),
+                                    alertSent: true, // Ya se habían enviado alertas antes
+                                });
+                            }
+                        } else {
+                            // No hay evento reciente, crear doorState normal
+                            doorState.set(username, {
+                                status: parsed.doorStatus || 'closed',
+                                lastSaved10MinSlot: null,
+                                lastSaved4HSlot: null,
+                                currentEvent: null,
+                                doorOpenedAt: null,
+                                alertSent: false,
+                            });
+                            console.log(`🚪 doorState creado para ${username}`);
+                        }
+                    } catch (err) {
+                        console.error(`❌ Error restaurando evento: ${err.message}`);
+
+                        // Crear doorState por defecto en caso de error
+                        doorState.set(username, {
+                            status: parsed.doorStatus || 'closed',
+                            lastSaved10MinSlot: null,
+                            lastSaved4HSlot: null,
+                            currentEvent: null,
+                            doorOpenedAt: null,
+                            alertSent: false,
+                        });
+                    }
                 }
 
                 if (username.startsWith('MOBILE_OBSERVER_')) {
@@ -446,7 +523,6 @@ wss.on('connection', (ws) => {
                 return;
             }
 
-            // ⬇️ NUEVA VALIDACIÓN
             const validation = validateSensorData(parsed);
 
             if (!validation.valid) {
@@ -454,7 +530,6 @@ wss.on('connection', (ws) => {
                 return;
             }
 
-            // ⬇️ LOG MEJORADO: Indicar qué sensores están activos
             const sensorStatus = [];
             if (validation.activeSensors.dht) sensorStatus.push('DHT✓');
             else sensorStatus.push('DHT✗');
@@ -476,7 +551,6 @@ wss.on('connection', (ws) => {
                 });
             }
 
-            // Guardar datos solo si hay al menos un sensor activo
             if (validation.activeSensors.dht || validation.activeSensors.ds18b20) {
                 await saveTo10MinData(username, parsed);
                 await saveTo4HData(username, parsed);
@@ -529,10 +603,9 @@ wss.on('connection', (ws) => {
                     console.log(`🧹 Caché de datos eliminado para ${username}`);
                 }
 
-                if (doorState.has(username)) {
-                    doorState.delete(username);
-                    console.log(`🚪 Estado de puerta eliminado para ${username}`);
-                }
+                // ⬇️ MODIFICADO: NO eliminar doorState inmediatamente (esperar por reconexión)
+                // doorState permanece para poder restaurar contexto
+                console.log(`⏳ ${username}: Estado preservado para posible reconexión`);
 
                 if (username.startsWith('MOBILE_OBSERVER_')) {
                     if (fcmTokens.has(username)) {
@@ -577,7 +650,6 @@ function get4HSlot(datetime) {
     return date;
 }
 
-// ⬇️ FUNCIÓN MODIFICADA: Guardar con valores null
 async function saveTo10MinData(username, data) {
     try {
         const slot = get10MinSlot(data.datetime);
@@ -607,7 +679,6 @@ async function saveTo10MinData(username, data) {
             doorState.set(username, state);
         }
 
-        // Log mejorado
         const tempOut = data.dsTemperature !== null ? `${data.dsTemperature}°C` : 'N/A';
         const tempIn = data.temperature !== null ? `${data.temperature}°C` : 'N/A';
         const humidity = data.humidity !== null ? `${data.humidity}%` : 'N/A';
@@ -658,11 +729,8 @@ async function saveTo4HData(username, data) {
     }
 }
 
-// ⬇️ FUNCIÓN MODIFICADA: Solo procesar si dsTemperature no es null
 async function handleTemperatureAlerts(username, data) {
-    // Solo procesar si dsTemperature no es null
     if (data.dsTemperature === null) {
-        // Si el sensor se desconectó, limpiar alertas activas
         if (tempAlertState.has(username)) {
             console.log(`🛑 ${username}: Alerta temp cancelada (sensor desconectado)`);
 
@@ -948,6 +1016,64 @@ setInterval(() => {
         }
     }
 }, 10 * 60 * 1000);
+
+// ⬇️ NUEVA TAREA: Limpiar eventos huérfanos
+setInterval(async () => {
+    console.log('🧹 Verificando eventos de puerta...');
+
+    try {
+        const now = Date.now();
+        const activeEvents = await DoorEvent.find({ status: 'in_progress' });
+
+        for (const event of activeEvents) {
+            const username = event.username;
+            const timeOpen = now - event.opened_at.getTime();
+            const isDeviceConnected = userConnections.has(username) && userConnections.get(username).size > 0;
+
+            const minutes = Math.floor(timeOpen / 60000);
+
+            // ÚNICO CASO: Dispositivo DESCONECTADO + >5min = EVENTO INCOMPLETO
+            if (!isDeviceConnected && timeOpen > RECONNECTION_GRACE_PERIOD) {
+                console.log(`🔴 ${username}: Evento incompleto (desconectado >5min, ${minutes}min abierto)`);
+
+                event.status = 'incomplete';
+                event.closed_at = new Date();
+                event.duration_seconds = timeOpen / 1000;
+                event.temp_OUT_after = null;
+                event.temp_IN_after = null;
+                event.humidity_after = null;
+                event.metadata = {
+                    reason: 'device_disconnected',
+                    disconnection_minutes: minutes,
+                    auto_closed: true,
+                    detected_at: new Date()
+                };
+
+                await event.save();
+
+                // Limpiar alertas
+                if (alertIntervals.has(username)) {
+                    clearInterval(alertIntervals.get(username));
+                    alertIntervals.delete(username);
+                }
+
+                // Limpiar doorState
+                if (doorState.has(username)) {
+                    doorState.delete(username);
+                    console.log(`🚪 Estado de puerta eliminado para ${username}`);
+                }
+
+                console.log(`✅ ${username}: Evento marcado como incompleto: ${event._id}`);
+            }
+
+            // Si dispositivo está CONECTADO: NO hacer nada (sin importar el tiempo)
+            // El personal debe actuar según protocolo
+        }
+
+    } catch (err) {
+        console.error('❌ Error en limpieza de eventos:', err.message);
+    }
+}, 2 * 60 * 1000); // Ejecutar cada 2 minutos
 
 setInterval(() => {
     console.log('🧹 Limpiando tokens FCM viejos...');
