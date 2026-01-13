@@ -1,4 +1,4 @@
-// index.js - VERSIÓN CON LOOP UNIFICADO Y TRACKING DE DESCONEXIÓN
+// index.js - VERSIÓN FINAL CON MÚLTIPLES DESCONEXIONES Y SIN last_activity_at
 
 require('dotenv').config();
 
@@ -146,6 +146,30 @@ app.get('/api/debug/active-alerts', (req, res) => {
     });
 });
 
+app.get('/api/debug/memory', (req, res) => {
+    const used = process.memoryUsage();
+
+    res.json({
+        rss: `${Math.round(used.rss / 1024 / 1024)} MB`,
+        heapTotal: `${Math.round(used.heapTotal / 1024 / 1024)} MB`,
+        heapUsed: `${Math.round(used.heapUsed / 1024 / 1024)} MB`,
+        external: `${Math.round(used.external / 1024 / 1024)} MB`,
+
+        activeSensors: doorState.size,
+        activeConnections: Array.from(userConnections.values())
+            .reduce((sum, set) => sum + set.size, 0),
+        activeAlerts: alertIntervals.size,
+        fcmTokens: fcmTokens.size,
+        latestDataCache: latestDataPerSensor.size,
+        disconnectionTimestamps: disconnectionTimestamps.size,
+
+        estimatedAppMemory: `${(
+            (doorState.size * 2.13) +
+            (fcmTokens.size * 0.208)
+        ).toFixed(2)} KB`
+    });
+});
+
 app.get('/api/simulations', async (req, res) => {
     try {
         const sims = await Simulation.find({}, 'username');
@@ -281,7 +305,6 @@ async function sendAlertToAllObservers(username, data, alertType = 'door', timeO
 
     let title, body, extraData = {};
 
-    // Determinar tipo de alerta
     if (alertType === 'critical') {
         const tempStatus = data.dsTemperature < 1 ? 'TOO LOW' : 'TOO HIGH';
         title = '🚨 CRITICAL ALERT';
@@ -336,11 +359,11 @@ const doorState = new Map();
 const fcmTokens = new Map();
 const alertIntervals = new Map();
 const tempAlertState = new Map();
-const disconnectionTimestamps = new Map();  // ⬅️ NUEVO: Rastrear desconexiones
+const disconnectionTimestamps = new Map();
 
-const ALERT_DELAY = 60000;                    // 1 minuto
-const ALERT_INTERVAL = 20000;                 // 20 segundos
-const RECONNECTION_GRACE_PERIOD = 5 * 60 * 1000;  // 5 minutos
+const ALERT_DELAY = 60000;
+const ALERT_INTERVAL = 20000;
+const RECONNECTION_GRACE_PERIOD = 5 * 60 * 1000;
 
 server.on('upgrade', (req, socket, head) => {
     console.log("📡 Upgrade request for WebSocket");
@@ -418,7 +441,7 @@ wss.on('connection', (ws) => {
                 userConnections.get(username).add(ws);
                 console.log(`➕ WebSocket añadido para ${username}`);
 
-                // ⬇️ NUEVO: Limpiar timestamp de desconexión al reconectar
+                // ⬇️ LIMPIAR timestamp de desconexión al reconectar
                 if (disconnectionTimestamps.has(username)) {
                     const disconnectedFor = Date.now() - disconnectionTimestamps.get(username);
                     console.log(`✅ ${username}: Reconectado después de ${Math.floor(disconnectedFor/1000)}s desconectado`);
@@ -435,10 +458,30 @@ wss.on('connection', (ws) => {
                         }).sort({ opened_at: -1 });
 
                         if (recentEvent) {
-                            console.log(`🔄 ${username}: Restaurando evento activo tras reconexión: ${recentEvent._id}`);
+                            console.log(`🔄 ${username}: Evento activo encontrado tras reconexión: ${recentEvent._id}`);
+
+                            // ⬇️ ACTUALIZAR ÚLTIMA DESCONEXIÓN (si existe)
+                            if (recentEvent.disconnections && recentEvent.disconnections.length > 0) {
+                                const lastDisc = recentEvent.disconnections[recentEvent.disconnections.length - 1];
+
+                                if (lastDisc.reconnected_at === null) {
+                                    const disconnectedTime = Date.now() - lastDisc.disconnected_at.getTime();
+
+                                    lastDisc.reconnected_at = new Date();
+                                    lastDisc.duration_seconds = Math.floor(disconnectedTime / 1000);
+
+                                    // Actualizar tiempo total desconectado
+                                    recentEvent.total_disconnection_time_seconds = recentEvent.disconnections.reduce(
+                                        (total, disc) => total + (disc.duration_seconds || 0),
+                                        0
+                                    );
+
+                                    console.log(`✅ ${username}: Desconexión #${recentEvent.disconnections.length} completada (${lastDisc.duration_seconds}s)`);
+                                }
+                            }
 
                             if (parsed.doorStatus === 'closed') {
-                                console.log(`🔒 ${username}: Puerta cerrada al reconectar - Cerrando evento restaurado`);
+                                console.log(`🔒 ${username}: Puerta cerrada al reconectar - Cerrando evento`);
 
                                 const closedAt = new Date(parsed.datetime);
                                 const duration = (closedAt - recentEvent.opened_at) / 1000;
@@ -458,8 +501,10 @@ wss.on('connection', (ws) => {
 
                                 recentEvent.status = 'completed';
                                 recentEvent.metadata = {
+                                    ...recentEvent.metadata,
                                     reconnection: true,
-                                    closed_on_reconnect: true
+                                    closed_on_reconnect: true,
+                                    total_disconnections: recentEvent.disconnections.length
                                 };
 
                                 await recentEvent.save();
@@ -477,6 +522,15 @@ wss.on('connection', (ws) => {
 
                             } else {
                                 console.log(`🚨 ${username}: Puerta sigue abierta tras reconexión - Continuando evento`);
+
+                                recentEvent.metadata = {
+                                    ...recentEvent.metadata,
+                                    reconnection: true,
+                                    still_open_on_reconnect: true,
+                                    total_disconnections: recentEvent.disconnections.length
+                                };
+
+                                await recentEvent.save();
 
                                 doorState.set(username, {
                                     status: 'open',
@@ -560,7 +614,7 @@ wss.on('connection', (ws) => {
 
             await handleDoorEvents(username, parsed);
             await handleTemperatureAlerts(username, parsed);
-            await handleUnifiedAlerts(username, parsed);  // ⬅️ NUEVO: Manejo unificado de alertas
+            await handleUnifiedAlerts(username, parsed);
 
             wss.clients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) {
@@ -578,19 +632,38 @@ wss.on('connection', (ws) => {
         ws.lastMessageTime = Date.now();
     });
 
-    ws.on('close', () => {
+    ws.on('close', async () => {
         if (username && userConnections.has(username)) {
             userConnections.get(username).delete(ws);
 
             if (userConnections.get(username).size === 0) {
                 userConnections.delete(username);
 
-                // ⬇️ NUEVO: Registrar momento de desconexión
+                // ⬇️ REGISTRAR desconexión con puerta abierta
                 if (!username.startsWith('MOBILE_OBSERVER_')) {
                     const doorStateData = doorState.get(username);
+
                     if (doorStateData && doorStateData.status === 'open' && doorStateData.currentEvent) {
                         disconnectionTimestamps.set(username, Date.now());
                         console.log(`⏱️ ${username}: Desconexión registrada (puerta abierta)`);
+
+                        // ⬇️ AGREGAR nueva desconexión al array en BD
+                        try {
+                            const event = await DoorEvent.findById(doorStateData.currentEvent);
+                            if (event) {
+                                event.disconnections.push({
+                                    disconnected_at: new Date(),
+                                    reconnected_at: null,
+                                    duration_seconds: null,
+                                    reason: 'websocket_close'
+                                });
+                                await event.save();
+
+                                console.log(`📝 ${username}: Desconexión #${event.disconnections.length} registrada en BD`);
+                            }
+                        } catch (err) {
+                            console.error(`❌ Error registrando desconexión en BD: ${err.message}`);
+                        }
                     }
                 }
 
@@ -733,7 +806,6 @@ async function saveTo4HData(username, data) {
     }
 }
 
-// ⬇️ MODIFICADA: Solo actualizar estado, NO enviar alertas
 async function handleTemperatureAlerts(username, data) {
     if (data.dsTemperature === null) {
         if (tempAlertState.has(username)) {
@@ -777,7 +849,6 @@ async function handleDoorEvents(username, data) {
     const currentStatus = data.doorStatus;
     const previousStatus = state.status;
 
-    // PUERTA SE ABRE
     if (currentStatus === 'open' && previousStatus === 'closed') {
         console.log(`🔓 ${username}: PUERTA ABIERTA`);
 
@@ -791,7 +862,9 @@ async function handleDoorEvents(username, data) {
                 temp_IN_before: data.temperature !== null ? parseFloat(data.temperature) : null,
                 humidity_before: data.humidity !== null ? parseFloat(data.humidity) : null,
                 device_id: device ? device._id : null,
-                status: 'in_progress'
+                status: 'in_progress',
+                disconnections: [],  // ⬅️ Inicializar vacío
+                total_disconnection_time_seconds: 0
             });
 
             await newEvent.save();
@@ -805,7 +878,6 @@ async function handleDoorEvents(username, data) {
         }
     }
 
-    // PUERTA SE CIERRA
     else if (currentStatus === 'closed' && previousStatus === 'open') {
         console.log(`🔒 ${username}: PUERTA CERRADA`);
 
@@ -833,7 +905,8 @@ async function handleDoorEvents(username, data) {
                     await event.save();
 
                     const tempOutDrop = event.temp_OUT_drop !== null ? `${event.temp_OUT_drop.toFixed(1)}°C` : 'N/A';
-                    console.log(`✅ Evento completado: ${event._id} - Duración: ${duration.toFixed(0)}s - Δ T.OUT: ${tempOutDrop}`);
+                    const disconnections = event.disconnections ? event.disconnections.length : 0;
+                    console.log(`✅ Evento completado: ${event._id} - Duración: ${duration.toFixed(0)}s - Δ T.OUT: ${tempOutDrop} - Desconexiones: ${disconnections}`);
                 }
             } catch (err) {
                 console.error(`❌ Error cerrando evento: ${err.message}`);
@@ -850,7 +923,6 @@ async function handleDoorEvents(username, data) {
     doorState.set(username, state);
 }
 
-// ⬇️ NUEVA FUNCIÓN: Manejo unificado de alertas (UN SOLO LOOP)
 async function handleUnifiedAlerts(username, data) {
     const doorStateData = doorState.get(username);
     if (!doorStateData) return;
@@ -963,70 +1035,119 @@ setInterval(() => {
     }
 }, 10 * 60 * 1000);
 
-// ⬇️ MODIFICADA: Limpiar eventos huérfanos con tracking de desconexión
+// ⬇️ CLEANUP: Eventos con desconexión registrada (cada 2 minutos)
 setInterval(async () => {
-    console.log('🧹 Verificando eventos de puerta...');
+    console.log('🧹 Verificando eventos con desconexión...');
 
     try {
         const now = Date.now();
-        const activeEvents = await DoorEvent.find({ status: 'in_progress' });
 
-        for (const event of activeEvents) {
+        const eventsWithDisconnection = await DoorEvent.find({
+            status: 'in_progress',
+            'disconnections.0': { $exists: true }
+        });
+
+        for (const event of eventsWithDisconnection) {
             const username = event.username;
-            const isDeviceConnected = userConnections.has(username) && userConnections.get(username).size > 0;
+            const lastDisc = event.last_disconnection;
 
-            if (!isDeviceConnected) {
-                const disconnectedAt = disconnectionTimestamps.get(username);
+            if (lastDisc && lastDisc.reconnected_at === null) {
+                const disconnectedTime = now - lastDisc.disconnected_at.getTime();
+                const disconnectedMinutes = Math.floor(disconnectedTime / 1000 / 60);
 
-                if (disconnectedAt) {
-                    const disconnectedTime = now - disconnectedAt;
-                    const disconnection_seconds = Math.floor(disconnectedTime / 1000);
+                if (disconnectedTime > RECONNECTION_GRACE_PERIOD) {
+                    console.log(`🔴 ${username}: INCOMPLETE (desconectado ${disconnectedMinutes}min)`);
 
-                    if (disconnectedTime > RECONNECTION_GRACE_PERIOD) {
-                        const totalOpenTime = now - event.opened_at.getTime();
-                        const total_open_seconds = Math.floor(totalOpenTime / 1000);
+                    lastDisc.duration_seconds = Math.floor(disconnectedTime / 1000);
 
-                        console.log(`🔴 ${username}: Evento incompleto (desconectado ${disconnection_seconds}s de ${total_open_seconds}s total)`);
+                    const totalDisconnectionTime = event.disconnections.reduce(
+                        (total, disc) => {
+                            if (disc.reconnected_at) {
+                                return total + disc.duration_seconds;
+                            } else {
+                                return total + Math.floor((now - disc.disconnected_at.getTime()) / 1000);
+                            }
+                        },
+                        0
+                    );
 
-                        event.status = 'incomplete';
-                        event.closed_at = new Date();
-                        event.duration_seconds = total_open_seconds;
-                        event.temp_OUT_after = null;
-                        event.temp_IN_after = null;
-                        event.humidity_after = null;
-                        event.metadata = {
-                            reason: 'device_disconnected',
-                            disconnection_seconds: disconnection_seconds,
-                            total_open_seconds: total_open_seconds,
-                            auto_closed: true,
-                            detected_at: new Date()
-                        };
+                    event.status = 'incomplete';
+                    event.closed_at = new Date();
+                    event.duration_seconds = Math.floor((now - event.opened_at.getTime()) / 1000);
+                    event.total_disconnection_time_seconds = totalDisconnectionTime;
+                    event.metadata = {
+                        reason: 'device_never_reconnected',
+                        disconnected_for_seconds: lastDisc.duration_seconds,
+                        total_disconnections: event.disconnections.length,
+                        auto_closed: true,
+                        detected_at: new Date()
+                    };
 
-                        await event.save();
+                    await event.save();
 
-                        if (alertIntervals.has(username)) {
-                            clearInterval(alertIntervals.get(username));
-                            alertIntervals.delete(username);
-                        }
+                    console.log(`   └─ ID: ${event._id}`);
+                    console.log(`   └─ Abierto: ${event.duration_seconds}s total`);
+                    console.log(`   └─ Desconectado: ${totalDisconnectionTime}s total`);
 
-                        if (doorState.has(username)) {
-                            doorState.delete(username);
-                        }
-
-                        disconnectionTimestamps.delete(username);
-
-                        console.log(`✅ ${username}: Evento marcado como incompleto: ${event._id}`);
-                    } else {
-                        console.log(`⏳ ${username}: Esperando reconexión (${disconnection_seconds}s/${Math.floor(RECONNECTION_GRACE_PERIOD/1000)}s)`);
+                    if (doorState.has(username)) doorState.delete(username);
+                    if (alertIntervals.has(username)) {
+                        clearInterval(alertIntervals.get(username));
+                        alertIntervals.delete(username);
                     }
+                    if (disconnectionTimestamps.has(username)) {
+                        disconnectionTimestamps.delete(username);
+                    }
+
+                } else {
+                    const remainingSeconds = Math.floor((RECONNECTION_GRACE_PERIOD - disconnectedTime) / 1000);
+                    console.log(`⏳ ${username}: Esperando reconexión (quedan ${remainingSeconds}s)`);
                 }
             }
         }
 
     } catch (err) {
-        console.error('❌ Error en limpieza de eventos:', err.message);
+        console.error('❌ Error en cleanup de eventos con desconexión:', err.message);
     }
+
 }, 2 * 60 * 1000);
+
+// ⬇️ CLEANUP: Eventos zombies (cada 24 horas)
+setInterval(async () => {
+    console.log('🧹 Limpieza profunda: Buscando eventos zombies...');
+
+    try {
+        const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+        const zombieEvents = await DoorEvent.find({
+            status: 'in_progress',
+            opened_at: { $lt: cutoff }
+        });
+
+        for (const event of zombieEvents) {
+            const hoursOld = Math.floor((Date.now() - event.opened_at.getTime()) / 1000 / 3600);
+
+            console.log(`🧟 ${event.username}: Evento zombie detectado (${hoursOld}h antiguo)`);
+
+            event.status = 'incomplete';
+            event.closed_at = new Date();
+            event.duration_seconds = Math.floor((Date.now() - event.opened_at.getTime()) / 1000);
+            event.metadata = {
+                reason: 'zombie_event_cleanup',
+                hours_old: hoursOld,
+                note: 'Evento muy antiguo sin cerrar ni desconexión registrada',
+                auto_closed: true
+            };
+
+            await event.save();
+        }
+
+        console.log(`✅ Limpieza profunda completada. Zombies eliminados: ${zombieEvents.length}`);
+
+    } catch (err) {
+        console.error('❌ Error en limpieza de zombies:', err.message);
+    }
+
+}, 24 * 60 * 60 * 1000);
 
 setInterval(() => {
     console.log('🧹 Limpiando tokens FCM viejos...');
