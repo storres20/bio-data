@@ -21,15 +21,15 @@ const doorEventSchema = new mongoose.Schema({
     },
     temp_OUT_before: {
         type: Number,
-        default: null  // ⬅️ Cambiado: permite null si sensor desconectado
+        default: null
     },
     temp_IN_before: {
         type: Number,
-        default: null  // ⬅️ Cambiado: permite null si sensor desconectado
+        default: null
     },
     humidity_before: {
         type: Number,
-        default: null  // ⬅️ Cambiado: permite null si sensor desconectado
+        default: null
     },
 
     // Datos de cierre
@@ -64,10 +64,37 @@ const doorEventSchema = new mongoose.Schema({
         default: null
     },
 
+    // ⬇️ NUEVO: Historial de desconexiones/reconexiones
+    disconnections: [{
+        disconnected_at: {
+            type: Date,
+            required: true
+        },
+        reconnected_at: {
+            type: Date,
+            default: null
+        },
+        duration_seconds: {
+            type: Number,
+            default: null
+        },
+        reason: {
+            type: String,
+            enum: ['websocket_close', 'timeout', 'unknown', 'estimated_from_inactivity'],
+            default: 'websocket_close'
+        }
+    }],
+
+    // ⬇️ NUEVO: Tiempo total desconectado acumulado
+    total_disconnection_time_seconds: {
+        type: Number,
+        default: 0
+    },
+
     // Estado del evento
     status: {
         type: String,
-        enum: ['in_progress', 'completed', 'incomplete'],  // ⬅️ Agregado: 'incomplete'
+        enum: ['in_progress', 'completed', 'incomplete'],
         default: 'in_progress',
         index: true
     },
@@ -78,18 +105,49 @@ const doorEventSchema = new mongoose.Schema({
         default: null
     },
 
-    // ⬇️ NUEVO: Metadata para trazabilidad (opcional pero recomendado)
+    // Metadata para trazabilidad
     metadata: {
         type: Object,
         default: {}
     }
 }, {
-    timestamps: true // Agrega createdAt y updatedAt automáticamente
+    timestamps: true // createdAt y updatedAt
 });
 
-// Índice compuesto para búsquedas eficientes
+// Índices compuestos para queries eficientes
 doorEventSchema.index({ username: 1, opened_at: -1 });
 doorEventSchema.index({ username: 1, status: 1 });
-doorEventSchema.index({ status: 1, opened_at: -1 });  // ⬅️ Nuevo: para limpieza periódica
+doorEventSchema.index({ status: 1, opened_at: -1 });
+
+// ⬇️ NUEVO: Virtual para calcular tiempo total con puerta abierta
+doorEventSchema.virtual('total_open_time_seconds').get(function() {
+    if (!this.opened_at) return null;
+
+    const endTime = this.closed_at || new Date();
+    return Math.floor((endTime - this.opened_at) / 1000);
+});
+
+// ⬇️ NUEVO: Virtual para verificar si hay desconexión activa
+doorEventSchema.virtual('has_active_disconnection').get(function() {
+    if (!this.disconnections || this.disconnections.length === 0) return false;
+
+    const lastDisc = this.disconnections[this.disconnections.length - 1];
+    return lastDisc.reconnected_at === null;
+});
+
+// ⬇️ NUEVO: Virtual para obtener la última desconexión
+doorEventSchema.virtual('last_disconnection').get(function() {
+    if (!this.disconnections || this.disconnections.length === 0) return null;
+    return this.disconnections[this.disconnections.length - 1];
+});
+
+// ⬇️ NUEVO: Virtual para contar desconexiones
+doorEventSchema.virtual('disconnection_count').get(function() {
+    return this.disconnections ? this.disconnections.length : 0;
+});
+
+// Asegurar que los virtuals aparezcan en JSON
+doorEventSchema.set('toJSON', { virtuals: true });
+doorEventSchema.set('toObject', { virtuals: true });
 
 module.exports = mongoose.model('DoorEvent', doorEventSchema);
