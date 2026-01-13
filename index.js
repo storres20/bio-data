@@ -1,4 +1,4 @@
-// index.js - VERSIÓN CON RECONEXIÓN INTELIGENTE Y MANEJO DE EVENTOS HUÉRFANOS
+// index.js - VERSIÓN CON LOOP UNIFICADO Y TRACKING DE DESCONEXIÓN
 
 require('dotenv').config();
 
@@ -336,11 +336,11 @@ const doorState = new Map();
 const fcmTokens = new Map();
 const alertIntervals = new Map();
 const tempAlertState = new Map();
-const tempAlertIntervals = new Map();
+const disconnectionTimestamps = new Map();  // ⬅️ NUEVO: Rastrear desconexiones
 
 const ALERT_DELAY = 60000;                    // 1 minuto
 const ALERT_INTERVAL = 20000;                 // 20 segundos
-const RECONNECTION_GRACE_PERIOD = 5 * 60 * 1000;  // ⬅️ NUEVO: 5 minutos para esperar reconexión
+const RECONNECTION_GRACE_PERIOD = 5 * 60 * 1000;  // 5 minutos
 
 server.on('upgrade', (req, socket, head) => {
     console.log("📡 Upgrade request for WebSocket");
@@ -418,7 +418,14 @@ wss.on('connection', (ws) => {
                 userConnections.get(username).add(ws);
                 console.log(`➕ WebSocket añadido para ${username}`);
 
-                // ⬇️ NUEVO: Restaurar evento activo si existe uno reciente
+                // ⬇️ NUEVO: Limpiar timestamp de desconexión al reconectar
+                if (disconnectionTimestamps.has(username)) {
+                    const disconnectedFor = Date.now() - disconnectionTimestamps.get(username);
+                    console.log(`✅ ${username}: Reconectado después de ${Math.floor(disconnectedFor/1000)}s desconectado`);
+                    disconnectionTimestamps.delete(username);
+                }
+
+                // Restaurar evento activo si existe uno reciente
                 if (!username.startsWith('MOBILE_OBSERVER_')) {
                     try {
                         const recentEvent = await DoorEvent.findOne({
@@ -430,7 +437,6 @@ wss.on('connection', (ws) => {
                         if (recentEvent) {
                             console.log(`🔄 ${username}: Restaurando evento activo tras reconexión: ${recentEvent._id}`);
 
-                            // ⬇️ DETECTAR SI LA PUERTA ESTÁ CERRADA AL RECONECTAR
                             if (parsed.doorStatus === 'closed') {
                                 console.log(`🔒 ${username}: Puerta cerrada al reconectar - Cerrando evento restaurado`);
 
@@ -460,7 +466,6 @@ wss.on('connection', (ws) => {
 
                                 console.log(`✅ ${username}: Evento cerrado tras reconexión (duración: ${duration.toFixed(0)}s)`);
 
-                                // Crear doorState con puerta cerrada
                                 doorState.set(username, {
                                     status: 'closed',
                                     lastSaved10MinSlot: null,
@@ -471,7 +476,6 @@ wss.on('connection', (ws) => {
                                 });
 
                             } else {
-                                // ⬇️ PUERTA SIGUE ABIERTA - RESTAURAR CONTEXTO
                                 console.log(`🚨 ${username}: Puerta sigue abierta tras reconexión - Continuando evento`);
 
                                 doorState.set(username, {
@@ -480,11 +484,10 @@ wss.on('connection', (ws) => {
                                     lastSaved4HSlot: null,
                                     currentEvent: recentEvent._id,
                                     doorOpenedAt: recentEvent.opened_at.getTime(),
-                                    alertSent: true, // Ya se habían enviado alertas antes
+                                    alertSent: true,
                                 });
                             }
                         } else {
-                            // No hay evento reciente, crear doorState normal
                             doorState.set(username, {
                                 status: parsed.doorStatus || 'closed',
                                 lastSaved10MinSlot: null,
@@ -498,7 +501,6 @@ wss.on('connection', (ws) => {
                     } catch (err) {
                         console.error(`❌ Error restaurando evento: ${err.message}`);
 
-                        // Crear doorState por defecto en caso de error
                         doorState.set(username, {
                             status: parsed.doorStatus || 'closed',
                             lastSaved10MinSlot: null,
@@ -558,6 +560,7 @@ wss.on('connection', (ws) => {
 
             await handleDoorEvents(username, parsed);
             await handleTemperatureAlerts(username, parsed);
+            await handleUnifiedAlerts(username, parsed);  // ⬅️ NUEVO: Manejo unificado de alertas
 
             wss.clients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) {
@@ -582,16 +585,19 @@ wss.on('connection', (ws) => {
             if (userConnections.get(username).size === 0) {
                 userConnections.delete(username);
 
+                // ⬇️ NUEVO: Registrar momento de desconexión
+                if (!username.startsWith('MOBILE_OBSERVER_')) {
+                    const doorStateData = doorState.get(username);
+                    if (doorStateData && doorStateData.status === 'open' && doorStateData.currentEvent) {
+                        disconnectionTimestamps.set(username, Date.now());
+                        console.log(`⏱️ ${username}: Desconexión registrada (puerta abierta)`);
+                    }
+                }
+
                 if (alertIntervals.has(username)) {
                     clearInterval(alertIntervals.get(username));
                     alertIntervals.delete(username);
-                    console.log(`🛑 ${username}: Alertas de puerta detenidas (sensor desconectado)`);
-                }
-
-                if (tempAlertIntervals.has(username)) {
-                    clearInterval(tempAlertIntervals.get(username));
-                    tempAlertIntervals.delete(username);
-                    console.log(`🛑 ${username}: Alertas de temp detenidas (sensor desconectado)`);
+                    console.log(`🛑 ${username}: Alertas detenidas (sensor desconectado)`);
                 }
 
                 if (tempAlertState.has(username)) {
@@ -603,8 +609,6 @@ wss.on('connection', (ws) => {
                     console.log(`🧹 Caché de datos eliminado para ${username}`);
                 }
 
-                // ⬇️ MODIFICADO: NO eliminar doorState inmediatamente (esperar por reconexión)
-                // doorState permanece para poder restaurar contexto
                 console.log(`⏳ ${username}: Estado preservado para posible reconexión`);
 
                 if (username.startsWith('MOBILE_OBSERVER_')) {
@@ -729,16 +733,11 @@ async function saveTo4HData(username, data) {
     }
 }
 
+// ⬇️ MODIFICADA: Solo actualizar estado, NO enviar alertas
 async function handleTemperatureAlerts(username, data) {
     if (data.dsTemperature === null) {
         if (tempAlertState.has(username)) {
-            console.log(`🛑 ${username}: Alerta temp cancelada (sensor desconectado)`);
-
-            if (tempAlertIntervals.has(username)) {
-                clearInterval(tempAlertIntervals.get(username));
-                tempAlertIntervals.delete(username);
-            }
-
+            console.log(`🛑 ${username}: Estado temp cancelado (sensor desconectado)`);
             tempAlertState.delete(username);
         }
         return;
@@ -746,8 +745,6 @@ async function handleTemperatureAlerts(username, data) {
 
     const temp = parseFloat(data.dsTemperature);
     const now = Date.now();
-    const doorStateData = doorState.get(username);
-
     const isCritical = temp < 1 || temp > 6;
 
     if (isCritical) {
@@ -757,84 +754,17 @@ async function handleTemperatureAlerts(username, data) {
         if (!state) {
             tempAlertState.set(username, {
                 startTime: now,
-                lastAlertTime: 0,
                 temperature: temp,
-                type: type,
-                alertSent: false
+                type: type
             });
             console.log(`🌡️ ${username}: Temperatura ${type === 'low' ? 'BAJA' : 'ALTA'}: ${temp}°C`);
-
         } else {
-            const duration = now - state.startTime;
-
-            if (duration > ALERT_DELAY && !state.alertSent) {
-                console.log(`🚨 ${username}: TEMPERATURA ${type === 'low' ? 'BAJA' : 'ALTA'} >1 MIN`);
-
-                const isDoorOpen = doorStateData?.status === 'open';
-                const doorTimeOpen = isDoorOpen ? (now - doorStateData.doorOpenedAt) : 0;
-
-                let alertType;
-                if (isDoorOpen && doorTimeOpen > ALERT_DELAY) {
-                    alertType = 'critical';
-                    await sendAlertToAllObservers(username, data, alertType, doorTimeOpen, duration);
-                } else {
-                    alertType = type === 'low' ? 'temp_low' : 'temp_high';
-                    await sendAlertToAllObservers(username, data, alertType, 0, duration);
-                }
-
-                if (!tempAlertIntervals.has(username)) {
-                    const intervalId = setInterval(async () => {
-                        const currentState = tempAlertState.get(username);
-                        const currentDoorState = doorState.get(username);
-
-                        if (currentState) {
-                            const currentDuration = Date.now() - currentState.startTime;
-                            const currentTemp = currentState.temperature;
-
-                            if (currentTemp < 1 || currentTemp > 6) {
-                                const isDoorStillOpen = currentDoorState?.status === 'open';
-                                const currentDoorTime = isDoorStillOpen ? (Date.now() - currentDoorState.doorOpenedAt) : 0;
-
-                                let repeatAlertType;
-                                if (isDoorStillOpen && currentDoorTime > ALERT_DELAY) {
-                                    repeatAlertType = 'critical';
-                                    console.log(`🔔 ${username}: Alerta CRÍTICA repetida (puerta ${Math.floor(currentDoorTime/1000)}s + temp ${Math.floor(currentDuration/1000)}s)`);
-                                    await sendAlertToAllObservers(username, data, repeatAlertType, currentDoorTime, currentDuration);
-                                } else {
-                                    repeatAlertType = currentState.type === 'low' ? 'temp_low' : 'temp_high';
-                                    console.log(`🔔 ${username}: Alerta temp repetida (${Math.floor(currentDuration/1000)}s fuera de rango)`);
-                                    await sendAlertToAllObservers(username, data, repeatAlertType, 0, currentDuration);
-                                }
-                            } else {
-                                clearInterval(intervalId);
-                                tempAlertIntervals.delete(username);
-                                console.log(`✅ ${username}: Alertas de temp detenidas (normalizada)`);
-                            }
-                        } else {
-                            clearInterval(intervalId);
-                            tempAlertIntervals.delete(username);
-                        }
-                    }, ALERT_INTERVAL);
-
-                    tempAlertIntervals.set(username, intervalId);
-                    console.log(`⏰ ${username}: Loop de alertas temp iniciado (cada 20s)`);
-                }
-
-                state.alertSent = true;
-            }
-
             state.temperature = temp;
             state.type = type;
         }
     } else {
         if (tempAlertState.has(username)) {
             console.log(`✅ ${username}: Temperatura normalizada: ${temp}°C`);
-
-            if (tempAlertIntervals.has(username)) {
-                clearInterval(tempAlertIntervals.get(username));
-                tempAlertIntervals.delete(username);
-            }
-
             tempAlertState.delete(username);
         }
     }
@@ -846,8 +776,6 @@ async function handleDoorEvents(username, data) {
 
     const currentStatus = data.doorStatus;
     const previousStatus = state.status;
-    const temp = data.dsTemperature !== null ? parseFloat(data.dsTemperature) : null;
-    const isTempCritical = temp !== null && (temp < 1 || temp > 6);
 
     // PUERTA SE ABRE
     if (currentStatus === 'open' && previousStatus === 'closed') {
@@ -877,73 +805,9 @@ async function handleDoorEvents(username, data) {
         }
     }
 
-    // PUERTA SIGUE ABIERTA
-    else if (currentStatus === 'open' && previousStatus === 'open') {
-        if (state.doorOpenedAt && !state.alertSent) {
-            const timeOpen = Date.now() - state.doorOpenedAt;
-
-            if (timeOpen > ALERT_DELAY) {
-                const tempState = tempAlertState.get(username);
-                const hasTempAlert = tempState && tempState.alertSent;
-
-                let alertType = 'door';
-
-                if (isTempCritical && hasTempAlert) {
-                    alertType = 'critical';
-                    const tempDuration = Date.now() - tempState.startTime;
-                    console.log(`🚨 ${username}: ALERTA CRÍTICA - Puerta abierta >1min + Temperatura ${temp < 1 ? 'BAJA' : 'ALTA'}`);
-                    await sendAlertToAllObservers(username, data, alertType, timeOpen, tempDuration);
-                } else {
-                    console.log(`🚨 ${username}: PUERTA ABIERTA >1 MIN`);
-                    await sendAlertToAllObservers(username, data, alertType, timeOpen, 0);
-                }
-
-                if (!alertIntervals.has(username)) {
-                    const intervalId = setInterval(async () => {
-                        const currentState = doorState.get(username);
-
-                        if (currentState && currentState.status === 'open') {
-                            const currentTimeOpen = Date.now() - currentState.doorOpenedAt;
-                            const currentTempState = tempAlertState.get(username);
-                            const isStillTempCritical = data.dsTemperature !== null && (data.dsTemperature < 1 || data.dsTemperature > 6);
-
-                            let repeatAlertType = 'door';
-                            let tempDur = 0;
-
-                            if (isStillTempCritical && currentTempState) {
-                                repeatAlertType = 'critical';
-                                tempDur = Date.now() - currentTempState.startTime;
-                                console.log(`🔔 ${username}: Alerta CRÍTICA repetida (${Math.floor(currentTimeOpen/1000)}s abierta + temp crítica)`);
-                            } else {
-                                console.log(`🔔 ${username}: Alerta puerta repetida (${Math.floor(currentTimeOpen/1000)}s abierta)`);
-                            }
-
-                            await sendAlertToAllObservers(username, data, repeatAlertType, currentTimeOpen, tempDur);
-                        } else {
-                            clearInterval(intervalId);
-                            alertIntervals.delete(username);
-                            console.log(`✅ ${username}: Alertas de puerta detenidas (puerta cerrada)`);
-                        }
-                    }, ALERT_INTERVAL);
-
-                    alertIntervals.set(username, intervalId);
-                    console.log(`⏰ ${username}: Loop de alertas puerta iniciado (cada 20s)`);
-                }
-
-                state.alertSent = true;
-            }
-        }
-    }
-
     // PUERTA SE CIERRA
     else if (currentStatus === 'closed' && previousStatus === 'open') {
         console.log(`🔒 ${username}: PUERTA CERRADA`);
-
-        if (alertIntervals.has(username)) {
-            clearInterval(alertIntervals.get(username));
-            alertIntervals.delete(username);
-            console.log(`🛑 ${username}: Alertas de puerta detenidas`);
-        }
 
         if (state.currentEvent) {
             try {
@@ -986,6 +850,88 @@ async function handleDoorEvents(username, data) {
     doorState.set(username, state);
 }
 
+// ⬇️ NUEVA FUNCIÓN: Manejo unificado de alertas (UN SOLO LOOP)
+async function handleUnifiedAlerts(username, data) {
+    const doorStateData = doorState.get(username);
+    if (!doorStateData) return;
+
+    const now = Date.now();
+    const isDoorOpen = doorStateData.status === 'open';
+    const doorOpenTime = isDoorOpen && doorStateData.doorOpenedAt ? (now - doorStateData.doorOpenedAt) : 0;
+
+    const temp = data.dsTemperature !== null ? parseFloat(data.dsTemperature) : null;
+    const isTempCritical = temp !== null && (temp < 1 || temp > 6);
+
+    let tempState = tempAlertState.get(username);
+    let tempDuration = tempState ? (now - tempState.startTime) : 0;
+
+    const shouldAlert = (isDoorOpen && doorOpenTime > ALERT_DELAY) ||
+        (isTempCritical && tempDuration > ALERT_DELAY);
+
+    if (shouldAlert) {
+        let alertType = 'door';
+        if (isDoorOpen && doorOpenTime > ALERT_DELAY && isTempCritical && tempDuration > ALERT_DELAY) {
+            alertType = 'critical';
+        } else if (isTempCritical && tempDuration > ALERT_DELAY) {
+            alertType = temp < 1 ? 'temp_low' : 'temp_high';
+        }
+
+        if (!alertIntervals.has(username)) {
+            console.log(`🚨 ${username}: Primera alerta [${alertType.toUpperCase()}]`);
+            await sendAlertToAllObservers(username, data, alertType, doorOpenTime, tempDuration);
+
+            const intervalId = setInterval(async () => {
+                const currentDoorState = doorState.get(username);
+                const currentTempState = tempAlertState.get(username);
+
+                if (!currentDoorState) {
+                    clearInterval(intervalId);
+                    alertIntervals.delete(username);
+                    return;
+                }
+
+                const currentNow = Date.now();
+                const currentDoorOpen = currentDoorState.status === 'open';
+                const currentDoorTime = currentDoorOpen && currentDoorState.doorOpenedAt
+                    ? (currentNow - currentDoorState.doorOpenedAt)
+                    : 0;
+
+                const currentTemp = data.dsTemperature;
+                const currentTempCritical = currentTemp !== null && (currentTemp < 1 || currentTemp > 6);
+                const currentTempDuration = currentTempState ? (currentNow - currentTempState.startTime) : 0;
+
+                let currentAlertType = 'door';
+                if (currentDoorOpen && currentDoorTime > ALERT_DELAY &&
+                    currentTempCritical && currentTempDuration > ALERT_DELAY) {
+                    currentAlertType = 'critical';
+                } else if (currentTempCritical && currentTempDuration > ALERT_DELAY) {
+                    currentAlertType = currentTemp < 1 ? 'temp_low' : 'temp_high';
+                } else if (!currentDoorOpen || currentDoorTime <= ALERT_DELAY) {
+                    if (!currentTempCritical || currentTempDuration <= ALERT_DELAY) {
+                        clearInterval(intervalId);
+                        alertIntervals.delete(username);
+                        console.log(`✅ ${username}: Alertas detenidas (condiciones normalizadas)`);
+                        return;
+                    }
+                }
+
+                console.log(`🔔 ${username}: Alerta repetida [${currentAlertType.toUpperCase()}] (${Math.floor(currentDoorTime/1000)}s puerta, ${Math.floor(currentTempDuration/1000)}s temp)`);
+                await sendAlertToAllObservers(username, data, currentAlertType, currentDoorTime, currentTempDuration);
+
+            }, ALERT_INTERVAL);
+
+            alertIntervals.set(username, intervalId);
+            console.log(`⏰ ${username}: Loop de alertas iniciado (cada 20s)`);
+        }
+    } else {
+        if (alertIntervals.has(username)) {
+            clearInterval(alertIntervals.get(username));
+            alertIntervals.delete(username);
+            console.log(`🛑 ${username}: Alertas detenidas`);
+        }
+    }
+}
+
 setInterval(() => {
     const now = Date.now();
 
@@ -1017,7 +963,7 @@ setInterval(() => {
     }
 }, 10 * 60 * 1000);
 
-// ⬇️ NUEVA TAREA: Limpiar eventos huérfanos
+// ⬇️ MODIFICADA: Limpiar eventos huérfanos con tracking de desconexión
 setInterval(async () => {
     console.log('🧹 Verificando eventos de puerta...');
 
@@ -1027,53 +973,60 @@ setInterval(async () => {
 
         for (const event of activeEvents) {
             const username = event.username;
-            const timeOpen = now - event.opened_at.getTime();
             const isDeviceConnected = userConnections.has(username) && userConnections.get(username).size > 0;
 
-            const minutes = Math.floor(timeOpen / 60000);
+            if (!isDeviceConnected) {
+                const disconnectedAt = disconnectionTimestamps.get(username);
 
-            // ÚNICO CASO: Dispositivo DESCONECTADO + >5min = EVENTO INCOMPLETO
-            if (!isDeviceConnected && timeOpen > RECONNECTION_GRACE_PERIOD) {
-                console.log(`🔴 ${username}: Evento incompleto (desconectado >5min, ${minutes}min abierto)`);
+                if (disconnectedAt) {
+                    const disconnectedTime = now - disconnectedAt;
+                    const disconnection_seconds = Math.floor(disconnectedTime / 1000);
 
-                event.status = 'incomplete';
-                event.closed_at = new Date();
-                event.duration_seconds = timeOpen / 1000;
-                event.temp_OUT_after = null;
-                event.temp_IN_after = null;
-                event.humidity_after = null;
-                event.metadata = {
-                    reason: 'device_disconnected',
-                    disconnection_minutes: minutes,
-                    auto_closed: true,
-                    detected_at: new Date()
-                };
+                    if (disconnectedTime > RECONNECTION_GRACE_PERIOD) {
+                        const totalOpenTime = now - event.opened_at.getTime();
+                        const total_open_seconds = Math.floor(totalOpenTime / 1000);
 
-                await event.save();
+                        console.log(`🔴 ${username}: Evento incompleto (desconectado ${disconnection_seconds}s de ${total_open_seconds}s total)`);
 
-                // Limpiar alertas
-                if (alertIntervals.has(username)) {
-                    clearInterval(alertIntervals.get(username));
-                    alertIntervals.delete(username);
+                        event.status = 'incomplete';
+                        event.closed_at = new Date();
+                        event.duration_seconds = total_open_seconds;
+                        event.temp_OUT_after = null;
+                        event.temp_IN_after = null;
+                        event.humidity_after = null;
+                        event.metadata = {
+                            reason: 'device_disconnected',
+                            disconnection_seconds: disconnection_seconds,
+                            total_open_seconds: total_open_seconds,
+                            auto_closed: true,
+                            detected_at: new Date()
+                        };
+
+                        await event.save();
+
+                        if (alertIntervals.has(username)) {
+                            clearInterval(alertIntervals.get(username));
+                            alertIntervals.delete(username);
+                        }
+
+                        if (doorState.has(username)) {
+                            doorState.delete(username);
+                        }
+
+                        disconnectionTimestamps.delete(username);
+
+                        console.log(`✅ ${username}: Evento marcado como incompleto: ${event._id}`);
+                    } else {
+                        console.log(`⏳ ${username}: Esperando reconexión (${disconnection_seconds}s/${Math.floor(RECONNECTION_GRACE_PERIOD/1000)}s)`);
+                    }
                 }
-
-                // Limpiar doorState
-                if (doorState.has(username)) {
-                    doorState.delete(username);
-                    console.log(`🚪 Estado de puerta eliminado para ${username}`);
-                }
-
-                console.log(`✅ ${username}: Evento marcado como incompleto: ${event._id}`);
             }
-
-            // Si dispositivo está CONECTADO: NO hacer nada (sin importar el tiempo)
-            // El personal debe actuar según protocolo
         }
 
     } catch (err) {
         console.error('❌ Error en limpieza de eventos:', err.message);
     }
-}, 2 * 60 * 1000); // Ejecutar cada 2 minutos
+}, 2 * 60 * 1000);
 
 setInterval(() => {
     console.log('🧹 Limpiando tokens FCM viejos...');
